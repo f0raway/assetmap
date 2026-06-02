@@ -1,0 +1,111 @@
+# 手工补充资产模板
+# 用法：
+#   1. 复制本文件，例如复制为 data/manual_assets.yaml
+#   2. 删除不需要的字段，填入你额外掌握的资产
+#   3. 执行：assetmap import-assets <task_id> --file data/manual_assets.yaml
+#
+# 字段说明：
+#   units: 单位列表，每个单位下面填写该单位归属的资产
+#   unit: 单位/公司名称
+#   domains: 主域名/根域名，会进入后续子域名枚举和 DNS 解析
+#   subdomains: 已知子域名，会进入 DNS 解析
+#   ips: 已知公网 IP，会直接进入 port-scan
+#   urls: 已确认 Web 入口，会进入 URL 截图识别和报告
+#   apps: APP 备案或应用线索
+#   mini_programs: 小程序备案或小程序线索
+#   wechat_official_accounts: 微信公众号
+#   wechat_service_accounts: 微信服务号
+#   emails: 邮箱线索
+#   source_urls/review_checklist/review_status/notes: 复核留痕，不会当作资产导入
+#   如果确认某单位没有独立互联网资产，保留空资产列表并设置 review_status: no_assets_found
+
+units:
+  - unit: 示例集团有限公司
+    domains:
+      - example.cn
+      - example.com
+    subdomains:
+      - www.example.cn
+      - oa.example.cn
+    ips:
+      - 1.2.3.4
+    urls:
+      - url: https://portal.example.cn/login
+        system_name: 示例门户系统
+        site_purpose: 统一入口/登录门户
+    apps:
+      - name: 示例 APP
+        package: cn.example.app
+    mini_programs:
+      - name: 示例小程序
+        appid: wx123456
+    wechat_official_accounts:
+      - name: 示例公众号
+        account: example-official
+    wechat_service_accounts:
+      - name: 示例服务号
+        account: example-service
+    emails:
+      - security@example.cn
+    source_urls:
+      - https://beian.miit.gov.cn/
+    review_checklist:
+      - source: 工信部ICP备案
+        status: done
+        notes: 已核验备案域名
+      - source: 官网/搜索引擎
+        status: pending
+        notes: ""
+      - source: 微信公众号/小程序
+        status: pending
+        notes: ""
+      - source: 应用商店/APP备案
+        status: pending
+        notes: ""
+      - source: 内部台账/防火墙/邮箱
+        status: pending
+        notes: ""
+    review_status: pending
+    notes: ""
+
+  - unit: 示例子公司有限公司
+    domains:
+      - child-example.cn
+    subdomains:
+      - portal.child-example.cn
+    ips:
+      - 8.8.8.8
+    urls:
+      - http://portal.child-example.cn/
+    apps:
+      - name: 子公司 APP
+        package: cn.example.child
+    mini_programs: []
+    wechat_official_accounts: []
+    wechat_service_accounts: []
+    emails: []
+    source_urls: []
+    review_status: pending
+    notes: ""
+
+  - unit: 示例无独立资产项目公司
+    domains: []
+    subdomains: []
+    ips: []
+    urls: []
+    apps: []
+    mini_programs: []
+    wechat_official_accounts: []
+    wechat_service_accounts: []
+    emails: []
+    source_urls:
+      - https://beian.miit.gov.cn/
+    review_checklist:
+      - source: 工信部ICP备案
+        status: done
+        notes: 未发现备案
+      - source: 官网/搜索引擎
+        status: done
+        notes: 未发现独立官网
+    review_status: no_assets_found
+    notes: 人工复核未发现独立互联网资产

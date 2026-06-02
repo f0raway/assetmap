@@ -1,0 +1,100 @@
+database:
+  url: sqlite:///data/assetmap.db
+org:
+  control_threshold: 0.5
+  max_depth: 10
+enscan:
+  script: assetmap/collectors/tyc_invest_crawler.py
+  output_dir: data/enscan
+  timeout_seconds: 1800
+  tycid: YOUR_TYCID
+  auth_token: YOUR_TYC_AUTH_TOKEN
+  request_delay_seconds: 1
+  request_timeout_seconds: 20
+  asset_workers: 5
+  verbose: false
+tools:
+  tools_dir: tools
+  subdomain_tools_enabled:
+  - subfinder
+  - ksubdomain
+  subdomain_tool_timeout_seconds: 300
+  subfinder_command: '{binary} -d {domain} -silent -all -o {output}'
+  ksubdomain_command: '{binary} enum -d {domain} -f {wordlist} --silent --output-type txt -o {output}'
+  wordlist: data/wordlists/1.txt
+  nmap_command: '{binary} -Pn --top-ports 100 --open -sV --version-intensity 2 --min-hostgroup
+    24 --min-rate 800 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout
+    100ms --defeat-rst-ratelimit --max-retries 2 --host-timeout 1800s {target} -oX
+    {xml_output} -oN {normal_output}'
+  nmap_mode: batch
+  nmap_batch_command: '{binary} -Pn --top-ports 100 --open -sV --version-intensity
+    2 --min-hostgroup 24 --min-rate 800 --initial-rtt-timeout 300ms --max-rtt-timeout
+    2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit --max-retries 2 --host-timeout
+    1800s -iL {targets_file} -oX {xml_output} -oN {normal_output}'
+  nmap_max_workers: 3
+  nmap_timeout_seconds: 600
+  nmap_service_detect_command: '{binary} -Pn -sV --version-intensity 5 -p {ports}
+    {target} -oX {xml_output} -oN {normal_output}'
+port_scan:
+  sources_enabled:
+  - fofa
+  target_sources_enabled:
+  - ai
+  - manual
+  - dns_public
+fofa:
+  base_url: https://fofa.info
+  email: YOUR_FOFA_EMAIL
+  api_key: YOUR_FOFA_API_KEY
+  fields: host,ip,port,protocol,title,server
+  size: 1000
+  full: false
+  timeout_seconds: 30
+dns:
+  timeout_seconds: 5.0
+  lifetime_seconds: 8.0
+  nameservers: []
+  max_workers: 20
+ai:
+  enabled: true
+  base_url: https://your-model-gateway.example.com/v1
+  api_key: YOUR_API_KEY
+  api_key_header: api-key
+  model: mimo-v2.5
+  timeout_seconds: 240
+  max_dns_records: 2000
+  max_prompt_chars: 160000
+  max_completion_tokens: 4096
+web_probe:
+  timeout_seconds: 8.0
+  max_workers: 20
+  max_body_bytes: 262144
+  max_domains_per_ip: 80
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
+    like Gecko) Chrome/125.0.0.0 Safari/537.36
+url_discovery:
+  timeout_seconds: 15.0
+  page_hard_timeout_seconds: 60
+  ai_timeout_seconds: 90
+  visual_max_pages: 50
+  screenshot_dir: data/screenshots
+  browser_channel: chrome
+  browser_headless: true
+  browser_wait_until: domcontentloaded
+  browser_wait_after_load_ms: 1500
+  screenshot_width: 1365
+  screenshot_height: 900
+  screenshot_full_page: false
+  screenshot_detail: low
+  allow_http_statuses:
+  - 200
+  - 201
+  - 202
+  - 204
+  - 301
+  - 302
+  - 303
+  - 307
+  - 308
+  - 401
+  - 403

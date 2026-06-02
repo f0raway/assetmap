@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assetmap"
+version = "0.1.0"
+description = "Internet digital asset exposure mapping CLI backed by ENScan Python collector"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "dnspython>=2.6,<3.0",
+  "httpx>=0.27,<1.0",
+  "openpyxl>=3.1,<4.0",
+  "pydantic>=2.7,<3.0",
+  "python-docx>=1.1,<2.0",
+  "PyYAML>=6.0",
+  "playwright>=1.44,<2.0",
+  "requests>=2.31,<3.0",
+  "sqlmodel>=0.0.22",
+  "typer>=0.12,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+assetmap = "assetmap.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["assetmap*"]

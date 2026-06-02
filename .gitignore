@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local sensitive config
+config.yaml
+ksubdomain.yaml
+.env
+.env.*
+*.local
+
+# Local tool metadata
+tools/**/.source_repo
+
+# Generated project data
+data/*
+!data/manual_assets.example.yaml
+!data/wordlists/
+!data/wordlists/**
+
+deliveries/
+exports/
