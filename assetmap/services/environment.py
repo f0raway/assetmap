@@ -15,9 +15,9 @@ PYTHON_IMPORTS = {
     "dnspython": "dns",
     "httpx": "httpx",
     "openpyxl": "openpyxl",
+    "Pillow": "PIL",
     "python-docx": "docx",
     "PyYAML": "yaml",
-    "playwright": "playwright.sync_api",
     "sqlmodel": "sqlmodel",
     "typer": "typer",
 }
@@ -30,6 +30,7 @@ class EnvironmentCheckService:
     def check(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         results.extend(self._python_imports())
+        results.extend(self._optional_python_imports())
         results.extend(self._external_tools())
         results.extend(self._browser())
         results.extend(self._files())
@@ -47,6 +48,17 @@ class EnvironmentCheckService:
             for name, module in PYTHON_IMPORTS.items()
         ]
 
+    def _optional_python_imports(self) -> list[dict[str, Any]]:
+        playwright_installed = _module_available("playwright.sync_api")
+        return [
+            self._result(
+                "python:playwright",
+                True,
+                "installed" if playwright_installed else "optional; URL screenshots will be skipped",
+                "Install visual dependency when screenshots are needed: pip install -e .[visual].",
+            )
+        ]
+
     def _external_tools(self) -> list[dict[str, Any]]:
         resolver = ToolResolver(self.config.tools)
         results = resolver.check_environment()
@@ -56,6 +68,15 @@ class EnvironmentCheckService:
         return results
 
     def _browser(self) -> list[dict[str, Any]]:
+        if not _module_available("playwright.sync_api"):
+            return [
+                self._result(
+                    "browser",
+                    True,
+                    "optional; skipped because playwright is not installed",
+                    "Install visual dependency when screenshots are needed: pip install -e .[visual].",
+                )
+            ]
         channel = (self.config.url_discovery.browser_channel or "").lower().strip()
         if channel != "chrome":
             return [
@@ -162,3 +183,10 @@ def _configured_secret(value: str | None) -> bool:
         return False
     upper = text.upper()
     return not (upper.startswith("YOUR_") or upper in {"CHANGE_ME", "TODO", "NONE", "NULL"})
+
+
+def _module_available(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        return False

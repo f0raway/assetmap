@@ -51,10 +51,31 @@ assetmap scan "苏州市能源发展集团有限公司" --strict
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install -e .[dev]
+python -m pip install -U pip
+pip install -e .[dev] -i https://pypi.tuna.tsinghua.edu.cn/simple
 assetmap init
 assetmap env-check
 assetmap ai-check
+```
+
+如果需要 Web 页面截图和视觉识别，再安装浏览器自动化依赖：
+
+```powershell
+pip install -e .[visual]
+```
+
+完整开发环境可以一次安装：
+
+```powershell
+pip install -e .[dev,visual]
+```
+
+Linux 服务器上建议使用国内镜像并关闭 pip 版本检查，减少等待时间：
+
+```bash
+python -m pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -e ".[dev]" -i https://pypi.tuna.tsinghua.edu.cn/simple --disable-pip-version-check
+python -m pip install -e ".[visual]" -i https://pypi.tuna.tsinghua.edu.cn/simple --disable-pip-version-check
 ```
 
 `assetmap init` 会生成：
