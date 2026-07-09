@@ -14,6 +14,16 @@ def ai_headers(config: AiConfig) -> dict[str, str]:
     return {header_name: config.api_key, "Content-Type": "application/json"}
 
 
+def completion_finish_reason(response: dict[str, Any]) -> str:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    return str(first.get("finish_reason") or "")
+
+
 def chat_completion(
     config: AiConfig,
     messages: list[dict[str, Any]],

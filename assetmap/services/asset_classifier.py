@@ -286,7 +286,7 @@ class AssetClassifierService:
             if not self._should_probe_web(port):
                 skipped_non_web += 1
                 continue
-            hosts = self._probe_hosts(port, domains_by_ip, fofa_hosts_by_port)
+            hosts = self._probe_hosts(scan_task_id, port, domains_by_ip, fofa_hosts_by_port, rerun=rerun)
             for host in hosts:
                 for scheme in self._schemes_for_port(port.port):
                     if not rerun and self._probe_exists(scan_task_id, port.target_ip, port.port, scheme, host):
@@ -331,9 +331,11 @@ class AssetClassifierService:
 
     def _probe_hosts(
         self,
+        scan_task_id: int,
         port: NmapPort,
         domains_by_ip: dict[str, list[str]],
         fofa_hosts_by_port: dict[tuple[str, int], list[str]],
+        rerun: bool = False,
     ) -> list[str]:
         fofa_hosts = fofa_hosts_by_port.get((port.target_ip, port.port), [])
         dns_hosts = domains_by_ip.get(port.target_ip, [])
@@ -342,12 +344,23 @@ class AssetClassifierService:
         elif fofa_hosts:
             candidates = [port.target_ip, *fofa_hosts]
         else:
-            candidates = [port.target_ip, *dns_hosts[:3]]
+            candidates = [port.target_ip, *dns_hosts]
         hosts: list[str] = []
-        for host in candidates[: self.config.web_probe.max_domains_per_ip + 1]:
+        for host in candidates:
             if host not in hosts:
                 hosts.append(host)
-        return hosts
+        batch_size = max(1, self.config.web_probe.max_domains_per_ip) + 1
+        if rerun:
+            return hosts[:batch_size]
+        unprobed = [
+            host
+            for host in hosts
+            if any(
+                not self._probe_exists(scan_task_id, port.target_ip, port.port, scheme, host)
+                for scheme in self._schemes_for_port(port.port)
+            )
+        ]
+        return unprobed[:batch_size]
 
     def _schemes_for_port(self, port: int) -> tuple[str, str]:
         return ("https", "http") if port in {443, 8443, 9443} else ("http", "https")

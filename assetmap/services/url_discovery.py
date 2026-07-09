@@ -15,7 +15,7 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
-from assetmap.services.ai_client import chat_completion
+from assetmap.services.ai_client import chat_completion, completion_finish_reason
 
 
 JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.I | re.S)
@@ -98,9 +98,11 @@ def _screenshot_worker(payload: dict[str, Any], queue: Any) -> None:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
+            # 空字符串或 None 时使用 Playwright 自带 Chromium
+            channel = payload.get("browser_channel") or None
             try:
                 browser = playwright.chromium.launch(
-                    channel=payload["browser_channel"],
+                    channel=channel,
                     headless=payload["browser_headless"],
                 )
             except Exception:
@@ -594,15 +596,18 @@ class UrlDiscoveryService:
         reused = self._reuse_duplicate_visual_analysis(scan_task_id)
         if reused:
             self._log(f"[url] reused duplicate visual analysis: {reused}")
+        pending_total = len(self._pending_entrypoint_candidates(scan_task_id, rerun, retry_failed=retry_failed))
         entrypoints = self._pending_entrypoints(scan_task_id, rerun, retry_failed=retry_failed)
         if not entrypoints:
             self._log("[url] visual analysis pending pages: 0")
             self._clear_stale_visual_errors(scan_task_id)
             return
         total_rows = len(self.session.exec(select(WebEntrypoint).where(WebEntrypoint.scan_task_id == scan_task_id)).all())
+        remaining_after_batch = max(0, pending_total - len(entrypoints))
         self._log(
-            f"[url] visual analysis pending pages: {len(entrypoints)} "
-            f"(total={total_rows}, limit={self.config.url_discovery.visual_max_pages}, "
+            f"[url] visual analysis batch pages: {len(entrypoints)} "
+            f"(pending_total={pending_total}, remaining_after_batch={remaining_after_batch}, "
+            f"total={total_rows}, batch_size={self.config.url_discovery.visual_max_pages}, "
             f"rerun={rerun}, retry_failed={retry_failed})"
         )
         try:
@@ -664,6 +669,9 @@ class UrlDiscoveryService:
         self._log_visual_summary(scan_task_id)
 
     def _pending_entrypoints(self, scan_task_id: int, rerun: bool, retry_failed: bool = False) -> list[WebEntrypoint]:
+        return self._pending_entrypoint_candidates(scan_task_id, rerun, retry_failed=retry_failed)[: self.config.url_discovery.visual_max_pages]
+
+    def _pending_entrypoint_candidates(self, scan_task_id: int, rerun: bool, retry_failed: bool = False) -> list[WebEntrypoint]:
         rows = self.session.exec(select(WebEntrypoint).where(WebEntrypoint.scan_task_id == scan_task_id)).all()
         pending = []
         for row in rows:
@@ -686,7 +694,7 @@ class UrlDiscoveryService:
                     pending.append(row)
                 continue
             pending.append(row)
-        return sorted(pending, key=self._entrypoint_sort_key)[: self.config.url_discovery.visual_max_pages]
+        return sorted(pending, key=self._entrypoint_sort_key)
 
     def _entrypoint_sort_key(self, row: WebEntrypoint) -> tuple[int, str]:
         return (-self._entrypoint_score(row), row.normalized_url)
@@ -761,7 +769,9 @@ class UrlDiscoveryService:
         fallback_samples = []
         failed_samples = []
         low_confidence = []
+        low_confidence_count = 0
         screenshot_samples = []
+        entries = []
         for row in rows:
             evidence = row.evidence or {}
             visual = evidence.get("visual_analysis") or {}
@@ -774,14 +784,22 @@ class UrlDiscoveryService:
                 method = "pending"
             method_counts[method] = method_counts.get(method, 0) + 1
             item = {
+                "entry_id": row.id,
                 "url": row.normalized_url,
                 "final_url": row.final_url or "",
+                "host": row.host,
+                "target_ip": row.target_ip or "",
+                "port": row.port or "",
                 "http_status": row.http_status,
                 "title": row.title or "",
                 "method": method,
                 "system_name": visual.get("system_name") if isinstance(visual, dict) else "",
                 "site_purpose": visual.get("site_purpose") if isinstance(visual, dict) else "",
+                "confidence": visual.get("confidence") if isinstance(visual, dict) else "",
+                "screenshot_path": visual.get("screenshot_path") if isinstance(visual, dict) else "",
+                "error": evidence.get("visual_analysis_error") or "",
             }
+            entries.append(item)
             if method == "http_probe_fallback" and len(fallback_samples) < 50:
                 fallback_samples.append(
                     {
@@ -793,10 +811,12 @@ class UrlDiscoveryService:
             if method == "failed" and len(failed_samples) < 50:
                 failed_samples.append({**item, "error": evidence.get("visual_analysis_error")})
             confidence = _float_or_none(visual.get("confidence")) if isinstance(visual, dict) else None
-            if confidence is not None and confidence < 0.5 and len(low_confidence) < 50:
-                low_confidence.append({**item, "confidence": confidence})
+            if confidence is not None and confidence < 0.5:
+                low_confidence_count += 1
+                if len(low_confidence) < 50:
+                    low_confidence.append({**item, "confidence": confidence})
             screenshot = visual.get("screenshot_path") if isinstance(visual, dict) else ""
-            if screenshot and len(screenshot_samples) < 30:
+            if screenshot and len(screenshot_samples) < 50:
                 screenshot_samples.append({**item, "screenshot_path": screenshot})
         payload = {
             "scan_task_id": scan_task_id,
@@ -806,7 +826,9 @@ class UrlDiscoveryService:
             "fallback_count": method_counts.get("http_probe_fallback", 0),
             "failed_count": method_counts.get("failed", 0),
             "pending_count": method_counts.get("pending", 0),
-            "low_confidence_count": len(low_confidence),
+            "screenshot_count": sum(1 for item in entries if item.get("screenshot_path")),
+            "low_confidence_count": low_confidence_count,
+            "entries": entries,
             "fallback_samples": fallback_samples,
             "failed_samples": failed_samples,
             "low_confidence_samples": low_confidence,
@@ -923,11 +945,65 @@ class UrlDiscoveryService:
             timeout_seconds=self.config.url_discovery.ai_timeout_seconds,
         )
         content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
-        analysis = self._parse_json(content)
+        analysis, parsed = self._parse_json_with_status(content)
+        if completion_finish_reason(response).lower() == "length" or not parsed:
+            retry_response = chat_completion(
+                self.config.ai,
+                self._compact_visual_messages(entry, image_data),
+                temperature=0.0,
+                max_completion_tokens=1600,
+                timeout_seconds=self.config.url_discovery.ai_timeout_seconds,
+            )
+            retry_content = retry_response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+            retry_analysis, retry_parsed = self._parse_json_with_status(retry_content)
+            if retry_parsed:
+                analysis = retry_analysis
+                analysis["retry_reason"] = "finish_reason=length" if completion_finish_reason(response).lower() == "length" else "invalid_json"
         analysis["model"] = self.config.ai.model
         return analysis
 
+    def _compact_visual_messages(self, entry: WebEntrypoint, image_data: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "只输出一个紧凑 JSON 对象，不要 Markdown，不要解释。字段："
+                    "system_name, website_title, site_purpose, page_type, organization, "
+                    "login_features, business_functions, tech_stack, confidence, notes。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            _clean_ai_text({
+                                "url": entry.final_url or entry.url,
+                                "html_title": entry.title,
+                                "http_status": entry.http_status,
+                                "server": entry.server,
+                                "known_tech_stack": entry.tech_stack,
+                            }),
+                            ensure_ascii=False,
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_data}",
+                            "detail": self.config.url_discovery.screenshot_detail,
+                        },
+                    },
+                ],
+            },
+        ]
+
     def _parse_json(self, content: str) -> dict[str, Any]:
+        data, _parsed = self._parse_json_with_status(content)
+        return data
+
+    def _parse_json_with_status(self, content: str) -> tuple[dict[str, Any], bool]:
         text = content.strip()
         match = JSON_BLOCK.search(text)
         if match:
@@ -940,8 +1016,8 @@ class UrlDiscoveryService:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            return {"notes": content[:2000], "confidence": 0}
-        return data if isinstance(data, dict) else {"notes": content[:2000], "confidence": 0}
+            return {"notes": content[:2000], "confidence": 0}, False
+        return (data, True) if isinstance(data, dict) else ({"notes": content[:2000], "confidence": 0}, False)
 
     def _error_message(self, exc: BaseException) -> str:
         if isinstance(exc, httpx.HTTPStatusError):
@@ -970,6 +1046,7 @@ class UrlDiscoveryService:
         if analysis.get("website_title") and not entry.title:
             entry.title = str(analysis["website_title"])[:300]
         self.session.add(entry)
+        self._sync_service_visual_evidence(entry, evidence["visual_analysis"])
         self.session.commit()
 
     def _save_error(
@@ -1024,6 +1101,7 @@ class UrlDiscoveryService:
         }
         entry.evidence = evidence
         self.session.add(entry)
+        self._sync_service_visual_evidence(entry, evidence["visual_analysis"])
         self.session.commit()
         return True
 
@@ -1073,8 +1151,64 @@ class UrlDiscoveryService:
         }
         entry.evidence = evidence
         self.session.add(entry)
+        self._sync_service_visual_evidence(entry, evidence["visual_analysis"])
         self.session.commit()
         return True
+
+    def _sync_service_visual_evidence(self, entry: WebEntrypoint, visual: dict[str, Any]) -> None:
+        if not entry.service_asset_id or not isinstance(visual, dict):
+            return
+        service = self.session.get(ServiceAsset, entry.service_asset_id)
+        if not service:
+            return
+        record = self._service_visual_record(entry, visual)
+        evidence = {**(service.evidence or {})}
+        records = [
+            item
+            for item in evidence.get("visual_entrypoints", [])
+            if isinstance(item, dict) and item.get("url") != record["url"]
+        ]
+        records.append(record)
+        records = sorted(records, key=lambda item: item.get("url") or "")
+        evidence["visual_entrypoints"] = records
+        evidence["visual_analysis_count"] = len(records)
+        evidence["visual_screenshot_count"] = sum(1 for item in records if item.get("screenshot_path"))
+        evidence["visual_analysis"] = self._representative_service_visual(records)
+        service.evidence = evidence
+        title = record.get("website_title") or record.get("system_name")
+        if title and not service.title:
+            service.title = str(title)[:300]
+        if record.get("system_name") and not service.app_name:
+            service.app_name = str(record["system_name"])[:300]
+        self.session.add(service)
+
+    def _service_visual_record(self, entry: WebEntrypoint, visual: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "url": entry.normalized_url,
+            "final_url": entry.final_url or visual.get("final_url") or "",
+            "host": entry.host,
+            "target_ip": entry.target_ip or "",
+            "port": entry.port or "",
+            "http_status": entry.http_status or "",
+            "html_title": entry.title or "",
+            "system_name": visual.get("system_name") or visual.get("website_title") or "",
+            "website_title": visual.get("website_title") or "",
+            "site_purpose": visual.get("site_purpose") or "",
+            "page_type": visual.get("page_type") or "",
+            "analysis_method": visual.get("analysis_method") or "screenshot_ai",
+            "confidence": visual.get("confidence") if visual.get("confidence") is not None else "",
+            "screenshot_path": visual.get("screenshot_path") or "",
+            "analyzed_at": visual.get("analyzed_at") or _utcnow().isoformat(),
+        }
+
+    def _representative_service_visual(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        def score(item: dict[str, Any]) -> tuple[float, int, int, str]:
+            confidence = _float_or_none(item.get("confidence")) or 0.0
+            has_label = 1 if item.get("system_name") or item.get("site_purpose") else 0
+            has_screenshot = 1 if item.get("screenshot_path") else 0
+            return (confidence, has_label, has_screenshot, item.get("url") or "")
+
+        return dict(max(records, key=score)) if records else {}
 
     def _has_probe_evidence(self, entry: WebEntrypoint) -> bool:
         status = entry.http_status or 0
@@ -1112,6 +1246,7 @@ class UrlDiscoveryService:
             evidence["visual_analysis"] = reused
             row.evidence = evidence
             self.session.add(row)
+            self._sync_service_visual_evidence(row, reused)
             changed += 1
         if changed:
             self.session.commit()

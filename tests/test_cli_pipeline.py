@@ -1,20 +1,22 @@
 from pathlib import Path
 
 from assetmap import cli
+from assetmap.cli import pipeline as pipeline_cli
+from assetmap.cli import review as review_cli
 from assetmap.config import AppConfig
 
 
 def test_manual_import_next_command_quotes_paths_with_spaces():
     command = cli.manual_import_next_command(49, Path("data/manual assets.yaml"))
 
-    assert command == 'assetmap run 49 --manual-file "data\\manual assets.yaml"'
+    assert command == 'assetmap run 49 --manual-file "data/manual assets.yaml"'
 
 
 def test_run_pipeline_force_changed_runs_completed_downstream(monkeypatch):
     calls: list[str] = []
 
-    monkeypatch.setattr(cli, "_stage_status_map", lambda session, task_id: {stage: "completed" for stage in cli.PIPELINE_STAGES})
-    monkeypatch.setattr(cli, "_warn_environment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_cli, "_stage_status_map", lambda session, task_id: {stage: "completed" for stage in cli.PIPELINE_STAGES})
+    monkeypatch.setattr(pipeline_cli, "_warn_environment", lambda *args, **kwargs: None)
 
     class FakeSubdomainService:
         def __init__(self, *args, **kwargs):
@@ -67,14 +69,14 @@ def test_run_pipeline_force_changed_runs_completed_downstream(monkeypatch):
         def get(self, task_id):
             return FakeStatus()
 
-    monkeypatch.setattr(cli, "SubdomainService", FakeSubdomainService)
-    monkeypatch.setattr(cli, "NmapScanService", FakeNmapScanService)
-    monkeypatch.setattr(cli, "AssetClassifierService", FakeAssetClassifierService)
-    monkeypatch.setattr(cli, "UrlDiscoveryService", FakeUrlDiscoveryService)
-    monkeypatch.setattr(cli, "ReportService", FakeReportService)
-    monkeypatch.setattr(cli, "PipelineStatusService", FakePipelineStatusService)
+    monkeypatch.setattr(pipeline_cli, "SubdomainService", FakeSubdomainService)
+    monkeypatch.setattr(pipeline_cli, "NmapScanService", FakeNmapScanService)
+    monkeypatch.setattr(pipeline_cli, "AssetClassifierService", FakeAssetClassifierService)
+    monkeypatch.setattr(pipeline_cli, "UrlDiscoveryService", FakeUrlDiscoveryService)
+    monkeypatch.setattr(pipeline_cli, "ReportService", FakeReportService)
+    monkeypatch.setattr(pipeline_cli, "PipelineStatusService", FakePipelineStatusService)
 
-    cli._run_pipeline(object(), AppConfig(), 49, progress=lambda message: None, force_changed=True)
+    pipeline_cli._run_pipeline(object(), AppConfig(), 49, progress=lambda message: None, force_changed=True)
 
     assert calls == ["subdomains", "port-scan", "classify", "url-discover", "report"]
 
@@ -94,10 +96,10 @@ def test_improve_execute_manual_review_action_writes_workorder(monkeypatch):
             calls.append(f"review:{task_id}:{path}:{force}")
             return FakeReviewResult()
 
-    monkeypatch.setattr(cli, "ReviewWorkOrderService", FakeReviewWorkOrderService)
-    monkeypatch.setattr(cli, "_run_pipeline", lambda *args, **kwargs: calls.append("pipeline"))
+    monkeypatch.setattr(review_cli, "ReviewWorkOrderService", FakeReviewWorkOrderService)
+    monkeypatch.setattr(pipeline_cli, "_run_pipeline", lambda *args, **kwargs: calls.append("pipeline"))
 
-    cli._execute_improve_actions(
+    review_cli._execute_improve_actions(
         object(),
         AppConfig(),
         49,
@@ -106,7 +108,7 @@ def test_improve_execute_manual_review_action_writes_workorder(monkeypatch):
         progress=lambda message: None,
     )
 
-    assert calls == ["review:49:data\\review_workorder.task_49.yaml:True"]
+    assert calls == ["review:49:data/review_workorder.task_49.yaml:True"]
 
 
 def test_improve_execute_deduplicates_manual_review_workorder(monkeypatch):
@@ -124,9 +126,9 @@ def test_improve_execute_deduplicates_manual_review_workorder(monkeypatch):
             calls.append(f"review:{task_id}")
             return FakeReviewResult()
 
-    monkeypatch.setattr(cli, "ReviewWorkOrderService", FakeReviewWorkOrderService)
+    monkeypatch.setattr(review_cli, "ReviewWorkOrderService", FakeReviewWorkOrderService)
 
-    cli._execute_improve_actions(
+    review_cli._execute_improve_actions(
         object(),
         AppConfig(),
         49,
@@ -150,9 +152,9 @@ def test_improve_execute_port_action_uses_sources_from_plan(monkeypatch):
     def fake_run_pipeline(session, cfg, task_id, **kwargs):
         seen_sources.append(list(cfg.port_scan.sources_enabled))
 
-    monkeypatch.setattr(cli, "_run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(pipeline_cli, "_run_pipeline", fake_run_pipeline)
 
-    cli._execute_improve_actions(
+    review_cli._execute_improve_actions(
         object(),
         config,
         49,
@@ -215,13 +217,13 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
             calls.append(f"verify:{package_path}")
             return FakeVerification()
 
-    monkeypatch.setattr(cli, "DiscoveryService", FakeDiscoveryService)
-    monkeypatch.setattr(cli, "_run_pipeline", lambda *args, **kwargs: calls.append(f"pipeline:{args[2]}:{kwargs.get('manual_file')}"))
-    monkeypatch.setattr(cli, "DeliveryQualityService", FakeQualityService)
-    monkeypatch.setattr(cli, "DeliveryPackageService", FakePackageService)
-    monkeypatch.setattr(cli, "DeliveryPackageVerifier", FakeVerifier)
+    monkeypatch.setattr(pipeline_cli, "DiscoveryService", FakeDiscoveryService)
+    monkeypatch.setattr(pipeline_cli, "_run_pipeline", lambda *args, **kwargs: calls.append(f"pipeline:{args[2]}:{kwargs.get('manual_file')}"))
+    monkeypatch.setattr(pipeline_cli, "DeliveryQualityService", FakeQualityService)
+    monkeypatch.setattr(pipeline_cli, "DeliveryPackageService", FakePackageService)
+    monkeypatch.setattr(pipeline_cli, "DeliveryPackageVerifier", FakeVerifier)
 
-    task_id = cli._run_one_click_scan(
+    task_id = pipeline_cli._run_one_click_scan(
         object(),
         AppConfig(),
         "Root Co",
@@ -233,8 +235,8 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
     assert task_id == 49
     assert calls == [
         "discover:Root Co:None:True",
-        "pipeline:49:data\\manual_assets.yaml",
+        "pipeline:49:data/manual_assets.yaml",
         "quality:49:reports",
         "package:49:reports:deliveries:False",
-        "verify:deliveries\\task_49.zip",
+        "verify:deliveries/task_49.zip",
     ]

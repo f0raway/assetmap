@@ -4,6 +4,7 @@ from pathlib import Path
 
 from docx import Document
 from openpyxl import load_workbook
+from sqlmodel import select
 
 from assetmap.config import AiConfig, AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
@@ -340,6 +341,25 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     assert any("补全计划" in item for item in broken.failures)
 
 
+def test_workbook_sanitizes_tool_control_characters(tmp_path: Path):
+    service = ReportService(None, AppConfig())  # type: ignore[arg-type]
+    workbook_path = tmp_path / "report.xlsx"
+
+    result = service._write_workbook(
+        workbook_path,
+        {
+            "交付审计文件": [
+                {
+                    "工具失败": "ksubdomain=\x1b[[1;31mFatal\x1b[0m] 获取网络设备超时\x00\x08",
+                }
+            ]
+        },
+    )
+
+    sheet = load_workbook(result)["交付审计文件"]
+    assert sheet["A2"].value == "ksubdomain=Fatal 获取网络设备超时"
+
+
 def test_quality_uses_latest_fallback_report_artifacts(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     service = DeliveryQualityService(None, config)  # type: ignore[arg-type]
@@ -465,6 +485,32 @@ def test_report_ai_analysis_cache_refreshes_when_payload_changes(tmp_path: Path,
     assert len(calls) == 1
     assert row is not None
     assert row.prompt_json["_cache_key"] == service._analysis_cache_key(service._analysis_prompt("端口与服务暴露分析", {"stats": {"资产数量": 2}}))
+
+
+def test_report_ai_analysis_retries_when_output_truncated(tmp_path: Path, monkeypatch):
+    config = AppConfig(
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"),
+        ai=AiConfig(enabled=True, model="mock-model"),
+    )
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+    calls = []
+
+    def fake_chat_completion(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"choices": [{"finish_reason": "length", "message": {"content": "未完成"}}]}
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "完整结论"}}]}
+
+    monkeypatch.setattr("assetmap.services.report.chat_completion", fake_chat_completion)
+
+    summary = service._analysis(1, "report_ports", "端口与服务暴露分析", {"stats": {"资产数量": 2}}, rerun_ai=False)
+    row = session.exec(select(AiAnalysis).where(AiAnalysis.analysis_type == "report_ports")).one()
+
+    assert summary == "完整结论"
+    assert [call["max_completion_tokens"] for call in calls] == [1800, 4096]
+    assert row.response_json["assetmap_retry"]["reason"] == "finish_reason=length"
 
 
 def test_improvement_plan_exports_actionable_next_steps(tmp_path: Path, monkeypatch):
@@ -871,6 +917,117 @@ def test_web_rows_enrich_empty_fallback_from_service_product_and_reason(tmp_path
     assert rows[0]["AI识别系统"] == "WebSphere Application Server/6.1"
     assert rows[0]["降级类型"] == "被动FOFA证据"
     assert "ERR_EMPTY_RESPONSE" in rows[0]["降级原因"]
+
+
+def test_screenshot_evidence_rows_keep_all_visual_results(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+    web_rows = [
+        {
+            "单位": "示例集团有限公司",
+            "URL": f"https://site{index}.example.cn/",
+            "AI识别系统": f"系统{index}",
+            "HTML标题": f"系统{index}",
+            "网站用途": "业务系统",
+            "识别方式": "screenshot_ai",
+            "识别置信度": 0.9,
+            "截图": f"shot{index}.png",
+            "分析错误": "",
+        }
+        for index in range(60)
+    ]
+
+    rows = service._screenshot_evidence_rows(web_rows, [])
+
+    assert len(rows) == 60
+    assert {row["URL"] for row in rows} == {row["URL"] for row in web_rows}
+
+
+def test_workbook_embeds_all_screenshot_thumbnails(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    rows = []
+    for index in range(25):
+        screenshot = tmp_path / f"shot_{index}.png"
+        screenshot.write_bytes(png_bytes)
+        rows.append({"缩略图": "", "URL": f"https://site{index}.example.cn/", "截图文件": str(screenshot)})
+
+    workbook_path = service._write_workbook(tmp_path / "web.xlsx", {"截图证据": rows})
+    sheet = load_workbook(workbook_path)["截图证据"]
+
+    assert sheet.max_row == 26
+    assert len(getattr(sheet, "_images", [])) == 25
+
+
+def test_service_audit_rows_include_visual_summary(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+
+    rows = service._service_audit_rows(
+        {
+            "service_assets": [
+                {
+                    "id": 1,
+                    "target_ip": "203.0.113.10",
+                    "protocol": "tcp",
+                    "port": 443,
+                    "asset_kind": "web",
+                    "host_mode": "virtual_host",
+                    "representative_url": "https://portal.example.cn/",
+                    "domains": ["portal.example.cn"],
+                }
+            ],
+            "web_probe_results": [],
+            "web_entrypoints": [
+                {
+                    "service_asset_id": 1,
+                    "normalized_url": "https://portal.example.cn/",
+                    "target_ip": "203.0.113.10",
+                    "port": 443,
+                },
+                {
+                    "service_asset_id": 1,
+                    "normalized_url": "https://portal.example.cn/admin",
+                    "target_ip": "203.0.113.10",
+                    "port": 443,
+                },
+            ],
+        },
+        {"portal.example.cn": "示例集团有限公司"},
+        {},
+        {},
+        web_rows=[
+            {
+                "IP": "203.0.113.10",
+                "端口": 443,
+                "AI识别系统": "统一门户",
+                "网站用途": "业务入口",
+                "截图": "portal.png",
+            },
+            {
+                "IP": "203.0.113.10",
+                "端口": 443,
+                "AI识别系统": "后台管理",
+                "网站用途": "管理入口",
+                "截图": "admin.png",
+            },
+        ],
+    )
+
+    assert rows[0]["URL入口数量"] == 2
+    assert rows[0]["视觉识别数量"] == 2
+    assert rows[0]["截图数量"] == 2
+    assert rows[0]["AI识别系统"] == "统一门户；后台管理"
+    assert rows[0]["网站用途"] == "业务入口；管理入口"
 
 
 def test_visual_review_rows_explain_fallback_category_and_mojibake(tmp_path: Path):

@@ -5,7 +5,12 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import AiAnalysis, Company, CompanyAssetLink, DnsQueryStatus, DnsRecord, InternetAsset, SubdomainRecord, SubdomainToolRun
-from assetmap.services.subdomain import SubdomainService, _tool_line_dns_values, _tool_line_hostname
+from assetmap.services.nmap_scan import extract_ai_marked_service_ips
+from assetmap.services.subdomain import (
+    SubdomainService,
+    _tool_line_dns_values,
+    _tool_line_hostname,
+)
 
 
 def test_clear_dns_results_removes_records_and_statuses(tmp_path: Path):
@@ -55,6 +60,33 @@ def test_dns_ai_analysis_uses_cache_when_payload_unchanged(tmp_path: Path):
     assert row.prompt_json["fingerprint"]
 
 
+def test_dns_ai_analysis_batches_and_merges_targets(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("assetmap.services.subdomain.DNS_AI_BATCH_MAX_RECORDS", 1)
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.ai.enabled = True
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+    calls: list[list[str]] = []
+
+    def fake_call(_ai_config, payload):
+        calls.append(payload["dns_records"])
+        ip = payload["dns_records"][0].split("|")[-1]
+        return {"choices": [{"message": {"content": f"NMAP_TARGET_IPS\n- {ip} | high | test\nEND_NMAP_TARGET_IPS"}}]}
+
+    service._call_ai = fake_call  # type: ignore[method-assign]
+    session.add(DnsRecord(scan_task_id=1, fqdn="a.example.cn", root_domain="example.cn", record_type="A", value="8.8.8.8"))
+    session.add(DnsRecord(scan_task_id=1, fqdn="b.example.cn", root_domain="example.cn", record_type="A", value="1.1.1.1"))
+    session.commit()
+
+    service._run_ai_analysis(1)
+
+    row = session.exec(select(AiAnalysis).where(AiAnalysis.analysis_type == "dns_inference")).one()
+    assert len(calls) == 2
+    assert row.prompt_json["batch_count"] == 2
+    assert sorted(extract_ai_marked_service_ips(row.summary or "")) == ["1.1.1.1", "8.8.8.8"]
+
+
 def test_root_domains_are_longest_first_for_specific_matching(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
@@ -79,21 +111,18 @@ def test_root_domains_are_longest_first_for_specific_matching(tmp_path: Path):
     assert service._root_for_domain(1, "api.child.example.cn") == "child.example.cn"
 
 
-def test_parse_ksubdomain_chain_output_merges_subdomain_and_dns(tmp_path: Path):
+def test_parse_dnsx_output_merges_subdomain_only(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
-    output = tmp_path / "ksubdomain.txt"
-    output.write_text(
-        "www.example.cn=>CNAME edge.example.net=>8.8.8.8=>198.18.1.1\n",
-        encoding="utf-8",
-    )
+    output = tmp_path / "dnsx.txt"
+    output.write_text("www.example.cn\n", encoding="utf-8")
     session.add(
         SubdomainToolRun(
             scan_task_id=1,
             root_domain="example.cn",
-            tool_name="ksubdomain",
-            command="ksubdomain",
+            tool_name="dnsx",
+            command="dnsx",
             output_path=str(output),
             status="completed",
         )
@@ -103,13 +132,39 @@ def test_parse_ksubdomain_chain_output_merges_subdomain_and_dns(tmp_path: Path):
     SubdomainService(session, config)._parse_tool_outputs(1, ["example.cn"])
 
     subdomain = session.exec(select(SubdomainRecord)).one()
-    records = session.exec(select(DnsRecord).order_by(DnsRecord.record_type, DnsRecord.value)).all()
     assert subdomain.fqdn == "www.example.cn"
-    assert subdomain.sources == ["ksubdomain"]
-    assert [(row.record_type, row.value) for row in records] == [
-        ("A", "8.8.8.8"),
-        ("CNAME", "edge.example.net"),
-    ]
+    assert subdomain.sources == ["dnsx"]
+    assert session.exec(select(DnsRecord)).all() == []
+
+
+def test_parse_dnsx_skips_large_output_and_removes_pollution(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.tools.subdomain_tool_max_output_lines = 2
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    output = tmp_path / "dnsx.txt"
+    output.write_text("a.example.cn\nb.example.cn\nc.example.cn\n", encoding="utf-8")
+    session.add(
+        SubdomainToolRun(
+            scan_task_id=1,
+            root_domain="example.cn",
+            tool_name="dnsx",
+            command="dnsx",
+            output_path=str(output),
+            status="completed",
+        )
+    )
+    session.add(SubdomainRecord(scan_task_id=1, root_domain="example.cn", fqdn="old.example.cn", sources=["dnsx"]))
+    session.add(SubdomainRecord(scan_task_id=1, root_domain="example.cn", fqdn="keep.example.cn", sources=["subfinder", "dnsx"]))
+    session.commit()
+    logs: list[str] = []
+
+    SubdomainService(session, config, progress=logs.append)._parse_tool_outputs(1, ["example.cn"])
+
+    rows = session.exec(select(SubdomainRecord).order_by(SubdomainRecord.fqdn)).all()
+    assert [(row.fqdn, row.sources) for row in rows] == [("keep.example.cn", ["subfinder", "dnsx"])]
+    assert any("skipped dnsx output for example.cn" in line for line in logs)
+    assert any("removed_tool_only=1" in line for line in logs)
 
 
 def test_subdomain_tool_summary_logs_failures(tmp_path: Path):
@@ -121,7 +176,7 @@ def test_subdomain_tool_summary_logs_failures(tmp_path: Path):
         SubdomainToolRun(
             scan_task_id=1,
             root_domain="example.cn",
-            tool_name="ksubdomain",
+            tool_name="dnsx",
             command="",
             output_path="",
             status="failed",
@@ -134,7 +189,22 @@ def test_subdomain_tool_summary_logs_failures(tmp_path: Path):
     SubdomainService(session, config, progress=logs.append)._log_tool_summary(1)
 
     assert "[subdomain] tool summary: completed=1, failed=1" in logs
-    assert any("ksubdomain:example.cn timeout" in line for line in logs)
+    assert any("dnsx:example.cn timeout" in line for line in logs)
+
+
+def test_subdomain_tool_summary_ignores_disabled_legacy_ksubdomain(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.tools.subdomain_tools_enabled = ["subfinder", "dnsx"]
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="subfinder", command="", output_path="", status="completed"))
+    session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="ksubdomain", command="", output_path="", status="failed", error_message="timeout"))
+    session.commit()
+    logs: list[str] = []
+
+    SubdomainService(session, config, progress=logs.append)._log_tool_summary(1)
+
+    assert logs == ["[subdomain] tool summary: completed=1"]
 
 
 def test_interrupted_tool_run_is_detected(tmp_path: Path):
@@ -229,9 +299,67 @@ def test_dns_resolution_skips_non_public_a_records(tmp_path: Path):
             return FakeAnswer([FakeItem("198.18.1.1"), FakeItem("8.8.8.8")])
 
     service._resolver = lambda: FakeResolver()  # type: ignore[method-assign]
+    service._resolve_doh_records = lambda _fqdn, _record_type: {"completed": False, "records": [], "error": "offline"}  # type: ignore[method-assign]
 
     result = service._resolve_one(1, "example.cn", "example.cn", "A")
 
     records = session.exec(select(DnsRecord)).all()
     assert result == {"saved": 1, "skipped": 1}
     assert [(row.record_type, row.value) for row in records] == [("A", "8.8.8.8")]
+
+
+def test_dns_resolution_uses_doh_before_udp(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+
+    service._resolver = lambda: (_ for _ in ()).throw(AssertionError("UDP DNS should not be used"))  # type: ignore[method-assign]
+    service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
+        "completed": True,
+        "records": [{"value": "47.101.48.251", "ttl": 120, "endpoint": "https://dns.google/resolve"}],
+        "error": None,
+    }
+
+    result = service._resolve_one(1, "www.example.cn", "example.cn", "A")
+
+    records = session.exec(select(DnsRecord)).all()
+    assert result == {"saved": 1, "skipped": 0}
+    assert [(row.record_type, row.value, row.ttl, row.raw_payload["source"]) for row in records] == [
+        ("A", "47.101.48.251", 120, "doh")
+    ]
+
+
+def test_dns_resolution_skips_polluted_doh_ip(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+    service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
+        "completed": True,
+        "records": [{"value": "198.18.0.136", "ttl": 120, "endpoint": "https://dns.google/resolve"}],
+        "error": None,
+    }
+
+    result = service._resolve_one(1, "www.example.cn", "example.cn", "A")
+
+    assert result == {"saved": 0, "skipped": 1}
+    assert session.exec(select(DnsRecord)).all() == []
+
+
+def test_discovered_subdomains_are_logged_before_dns(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(SubdomainRecord(scan_task_id=1, root_domain="example.cn", fqdn="www.example.cn", sources=["subfinder"]))
+    session.add(SubdomainRecord(scan_task_id=1, root_domain="example.cn", fqdn="api.example.cn", sources=["dnsx"]))
+    session.commit()
+    logs: list[str] = []
+
+    SubdomainService(session, config, progress=logs.append)._log_discovered_subdomains(1)
+
+    output = tmp_path / "data" / "subdomains" / "task_1" / "discovered_subdomains.txt"
+    assert output.read_text(encoding="utf-8").splitlines() == ["api.example.cn", "www.example.cn"]
+    assert "[subdomain] discovered subdomains before DNS: 2" in logs
+    assert any("api.example.cn" in line and "www.example.cn" in line for line in logs)

@@ -27,7 +27,7 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import AiAnalysis, ScanTask
-from assetmap.services.ai_client import chat_completion
+from assetmap.services.ai_client import chat_completion, completion_finish_reason
 from assetmap.services.exporter import ExportService
 
 
@@ -91,6 +91,20 @@ def _short(value: Any, limit: int = 4000) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:\[\[[0-?]*[ -/]*[@-~]\]?|\[[0-?]*[ -/]*[@-~]\]?)")
+EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+
+
+def _excel_cell_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, bool, datetime)):
+        return value
+    text = _text(value)
+    text = ANSI_ESCAPE_RE.sub("", text)
+    return EXCEL_ILLEGAL_CHARACTERS_RE.sub("", text)
+
+
 def _fofa_payload(port: dict) -> dict:
     payload = port.get("raw_payload") or {}
     if isinstance(payload.get("fofa"), dict):
@@ -111,7 +125,7 @@ REPORT_ANALYSIS_TITLES = {
     "report_summary": "总体暴露面结论与处置建议",
 }
 REPORT_ANALYSIS_CACHE_VERSION = "report-analysis-v2"
-MAX_EXCEL_SCREENSHOT_THUMBNAILS = 20
+MAX_EXCEL_SCREENSHOT_THUMBNAILS: int | None = None
 LOW_VALUE_WEB_TITLE_MARKERS = (
     "400",
     "403",
@@ -221,7 +235,7 @@ class ReportService:
         dns_quality_rows = self._dns_quality_rows(bundle, domain_units, review_attestations)
         unit_asset_rows = self._unit_asset_rows(bundle, company_names)
         web_rows = self._web_rows(bundle, domain_units, ip_units, dns_unit_by_ip, review_attestations)
-        service_audit_rows = self._service_audit_rows(bundle, domain_units, ip_units, dns_unit_by_ip, review_attestations)
+        service_audit_rows = self._service_audit_rows(bundle, domain_units, ip_units, dns_unit_by_ip, review_attestations, web_rows)
         url_coverage_rows = self._url_coverage_rows(bundle, service_audit_rows, review_attestations)
         visual_review_rows = self._visual_review_rows(web_rows, review_attestations)
         risk_rows = self._risk_rows(port_rows, web_rows)
@@ -920,6 +934,7 @@ class ReportService:
         ip_units: dict[str, str],
         dns_unit_by_ip: dict[str, str],
         review_attestations: dict[str, dict[str, dict]] | None = None,
+        web_rows: list[dict] | None = None,
     ) -> list[dict]:
         probes_by_key: dict[tuple[str, int], list[dict]] = {}
         for probe in bundle.get("web_probe_results", []):
@@ -933,6 +948,9 @@ class ReportService:
             if entry.get("service_asset_id"):
                 entries_by_service.setdefault(entry["service_asset_id"], []).append(entry)
         rows = []
+        visual_by_target: dict[tuple[str, Any], list[dict]] = {}
+        for row in web_rows or []:
+            visual_by_target.setdefault((row.get("IP") or "", row.get("端口") or ""), []).append(row)
         for service in sorted(bundle.get("service_assets", []), key=lambda item: (item.get("target_ip") or "", item.get("port") or 0)):
             probes = probes_by_key.get((service.get("target_ip"), service.get("port")), [])
             responded = [row for row in probes if row.get("status") == "responded"]
@@ -952,6 +970,7 @@ class ReportService:
                 entries = entries_by_url.get(representative_url, []) if representative_url else []
                 entry_count = len(entries)
                 entry_reuse = bool(entries)
+            visual_rows = visual_by_target.get((service.get("target_ip") or "", service.get("port") or ""), [])
             review_priority = "无"
             if kind != "web" and web_like:
                 review_priority = "中"
@@ -982,6 +1001,11 @@ class ReportService:
                     "HTTP状态分布": self._http_status_summary(responded),
                     "标题": service.get("title") or "",
                     "应用线索": service.get("app_name") or "",
+                    "视觉识别数量": len(visual_rows),
+                    "截图数量": sum(1 for item in visual_rows if item.get("截图")),
+                    "AI识别系统": self._join_unique((item.get("AI识别系统") for item in visual_rows), limit=8),
+                    "网站用途": self._join_unique((item.get("网站用途") for item in visual_rows), limit=8),
+                    "截图样例": self._join_unique((item.get("截图") for item in visual_rows), limit=5),
                     "分类依据": self._service_classification_reason(kind, service, probes, entry_count),
                     "建议动作": self._service_audit_action(review_priority, kind, web_like, entry_count, service.get("host_mode") or ""),
                 }
@@ -994,6 +1018,17 @@ class ReportService:
             rows.append(row)
         priority_order = {"高": 0, "中": 1, "低": 2, "无": 3}
         return sorted(rows, key=lambda item: (priority_order.get(item["复核优先级"], 9), item["单位"], item["IP"], item["端口"]))
+
+    def _join_unique(self, values: Any, limit: int = 5) -> str:
+        output = []
+        for value in values:
+            text = _text(value).strip()
+            if not text or text in output:
+                continue
+            output.append(text)
+            if len(output) >= limit:
+                break
+        return "；".join(output)
 
     def _service_review_type(self, kind: str, service: dict, web_like: bool, entry_count: int) -> str:
         if kind == "web" and entry_count == 0:
@@ -1964,7 +1999,7 @@ class ReportService:
                 "payload": {
                     "stats": context["stats"],
                     "coverage_gaps": context["coverage_rows"],
-                    "dns_records": context["dns_rows"][: self.config.ai.max_dns_records],
+                    "dns_records": context["dns_rows"],
                 },
             },
             "report_ports": {
@@ -2018,10 +2053,10 @@ class ReportService:
                 "role": "system",
                 "content": "你是资深互联网资产暴露面分析师。基于给定结构化数据写安全测绘报告分析，不要编造不存在的资产。",
             },
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)[: self.config.ai.max_prompt_chars]},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ]
         try:
-            response = chat_completion(self.config.ai, messages, temperature=0.1, max_completion_tokens=1800)
+            response = self._chat_analysis(messages, analysis_type)
             summary = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
             self._save_analysis(task_id, analysis_type, "completed", prompt, response, summary)
             self._log(f"[report] AI analysis completed: {analysis_type}")
@@ -2031,6 +2066,19 @@ class ReportService:
             self._save_analysis(task_id, analysis_type, "failed", prompt, {"error": str(exc)[:1000]}, summary)
             self._log(f"[report] AI analysis failed: {analysis_type} -> {str(exc)[:200]}")
             return summary
+
+    def _chat_analysis(self, messages: list[dict[str, Any]], analysis_type: str) -> dict:
+        response = chat_completion(self.config.ai, messages, temperature=0.1, max_completion_tokens=1800)
+        if completion_finish_reason(response).lower() != "length":
+            return response
+        self._log(f"[report] AI analysis output truncated, retry with larger budget: {analysis_type}")
+        retry_response = chat_completion(self.config.ai, messages, temperature=0.1, max_completion_tokens=4096)
+        retry_response["assetmap_retry"] = {
+            "reason": "finish_reason=length",
+            "initial_max_completion_tokens": 1800,
+            "retry_max_completion_tokens": 4096,
+        }
+        return retry_response
 
     def _analysis_prompt(self, title: str, payload: dict) -> dict:
         return {
@@ -2164,7 +2212,6 @@ class ReportService:
             "generated_at": _utcnow().isoformat(),
             "ai_enabled": self.config.ai.enabled,
             "configured_model": self.config.ai.model,
-            "max_prompt_chars": self.config.ai.max_prompt_chars,
             "section_count": len(sections),
             "status_counts": dict(sorted(status_counts.items())),
             "sections": sections,
@@ -2291,7 +2338,7 @@ class ReportService:
             headers = self._workbook_headers(rows)
             ws.append(headers)
             for row in rows:
-                ws.append([row.get(header, "") for header in headers])
+                ws.append([_excel_cell_value(row.get(header, "")) for header in headers])
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
             self._style_worksheet(ws, headers, sheet_name)
@@ -2326,7 +2373,7 @@ class ReportService:
         ws.column_dimensions[get_column_letter(thumb_column)].width = 34
         embedded = 0
         for row_index, row in enumerate(rows, start=2):
-            if embedded >= MAX_EXCEL_SCREENSHOT_THUMBNAILS:
+            if MAX_EXCEL_SCREENSHOT_THUMBNAILS is not None and embedded >= MAX_EXCEL_SCREENSHOT_THUMBNAILS:
                 break
             path_text = _text(row.get("截图文件"))
             if not path_text:
@@ -3067,7 +3114,7 @@ class ReportService:
 
     def _screenshot_evidence_rows(self, web_rows: list[dict], risk_rows: list[dict]) -> list[dict]:
         rows = []
-        for row in self._top_web_rows(web_rows, risk_rows)[:50]:
+        for row in self._top_web_rows(web_rows, risk_rows):
             screenshot = row.get("截图") or ""
             screenshot_exists = bool(screenshot and Path(str(screenshot)).exists())
             if screenshot_exists:

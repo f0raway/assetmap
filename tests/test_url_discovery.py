@@ -87,6 +87,37 @@ def test_seed_entrypoint_links_ip_site_probe_to_service_asset(tmp_path: Path):
     assert row.service_asset_id == service_asset.id
 
 
+def test_visual_ai_retries_when_json_is_truncated(tmp_path: Path, monkeypatch):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    screenshot = tmp_path / "page.png"
+    screenshot.write_bytes(b"png")
+    entry = WebEntrypoint(
+        scan_task_id=1,
+        host="portal.example.cn",
+        url="https://portal.example.cn/",
+        normalized_url="https://portal.example.cn/",
+        http_status=200,
+        title="统一门户",
+    )
+    calls = []
+
+    def fake_chat_completion(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return {"choices": [{"finish_reason": "length", "message": {"content": '{"system_name": "截断'}}]}
+        return {"choices": [{"finish_reason": "stop", "message": {"content": '{"system_name": "统一门户", "confidence": 0.9}'}}]}
+
+    monkeypatch.setattr("assetmap.services.url_discovery.chat_completion", fake_chat_completion)
+
+    analysis = UrlDiscoveryService(session, config)._analyze_with_ai(entry, screenshot)
+
+    assert analysis["system_name"] == "统一门户"
+    assert analysis["retry_reason"] == "finish_reason=length"
+    assert [call[1]["max_completion_tokens"] for call in calls] == [1200, 1600]
+
+
 def test_seed_entrypoint_canonicalizes_plain_http_on_https_port(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
@@ -280,10 +311,56 @@ def test_visual_summary_counts_success_and_failed(tmp_path: Path):
 
         assert any(line.endswith("total=2, ok=1, failed=1, pending=0") for line in logs)
         assert audit["method_counts"] == {"failed": 1, "screenshot_ai": 1}
+        assert audit["screenshot_count"] == 1
+        assert len(audit["entries"]) == 2
         assert audit["failed_samples"][0]["url"] == "https://fail.example.cn/"
         assert refreshed.evidence["visual_analysis"]["analysis_method"] == "screenshot_ai"
     finally:
         os.chdir(old_cwd)
+
+
+def test_save_analysis_syncs_visual_summary_to_service_asset(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service_asset = ServiceAsset(
+        scan_task_id=1,
+        target_ip="203.0.113.10",
+        port=443,
+        asset_kind="web",
+        representative_url="https://portal.example.cn/",
+    )
+    session.add(service_asset)
+    session.commit()
+    entry = WebEntrypoint(
+        scan_task_id=1,
+        service_asset_id=service_asset.id,
+        target_ip="203.0.113.10",
+        port=443,
+        host="portal.example.cn",
+        url="https://portal.example.cn/",
+        normalized_url="https://portal.example.cn/",
+        http_status=200,
+        title="统一门户",
+    )
+    session.add(entry)
+    session.commit()
+    screenshot = tmp_path / "portal.png"
+    screenshot.write_bytes(b"png")
+
+    UrlDiscoveryService(session, config)._save_analysis(
+        entry.id,
+        screenshot,
+        "https://portal.example.cn/login",
+        {"system_name": "统一门户", "site_purpose": "业务登录入口", "confidence": 0.92},
+    )
+    refreshed = session.get(ServiceAsset, service_asset.id)
+
+    assert refreshed.evidence["visual_analysis_count"] == 1
+    assert refreshed.evidence["visual_screenshot_count"] == 1
+    assert refreshed.evidence["visual_analysis"]["system_name"] == "统一门户"
+    assert refreshed.evidence["visual_entrypoints"][0]["url"] == "https://portal.example.cn/"
+    assert refreshed.app_name == "统一门户"
 
 
 def test_clean_ai_text_removes_replacement_characters():

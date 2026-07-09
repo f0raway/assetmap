@@ -46,6 +46,7 @@ class ToolResolver:
         results: list[dict[str, object]] = []
         if include_subdomain_tools:
             for tool_name in self.config.subdomain_tools_enabled:
+                tool_name = tool_name.lower().strip()
                 executable = self.executable(tool_name)
                 results.append(
                     {

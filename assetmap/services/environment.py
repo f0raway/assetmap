@@ -71,31 +71,79 @@ class EnvironmentCheckService:
         if not _module_available("playwright.sync_api"):
             return [
                 self._result(
-                    "browser",
-                    True,
-                    "optional; skipped because playwright is not installed",
-                    "Install visual dependency when screenshots are needed: pip install -e .[visual].",
+                    "browser:playwright",
+                    False,
+                    "playwright not installed",
+                    "Install visual dependency: pip install -e .[visual] && playwright install chromium",
                 )
             ]
-        channel = (self.config.url_discovery.browser_channel or "").lower().strip()
-        if channel != "chrome":
+        # 检查 Playwright Chromium 是否已安装
+        chromium_installed = self._check_playwright_chromium()
+        if chromium_installed:
             return [
                 self._result(
-                    "browser",
+                    "browser:playwright-chromium",
                     True,
-                    f"using Playwright bundled browser/channel: {self.config.url_discovery.browser_channel}",
+                    "Playwright Chromium installed",
                     "",
                 )
             ]
-        chrome = self._chrome_path()
         return [
             self._result(
-                "browser:chrome",
-                chrome is not None,
-                str(chrome) if chrome else "Chrome not found in PATH or common install locations",
-                "Install Chrome, or set url_discovery.browser_channel to a Playwright bundled browser channel.",
+                "browser:playwright-chromium",
+                False,
+                "Playwright Chromium not installed",
+                "Run: playwright install chromium",
             )
         ]
+
+    def _check_playwright_chromium(self) -> bool:
+        """检查 Playwright Chromium 是否已安装"""
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                # 尝试获取 Chromium 可执行文件路径
+                browser_type = p.chromium
+                # 检查浏览器是否可执行（通过检查路径）
+                import subprocess
+                result = subprocess.run(
+                    ["playwright", "install", "--dry-run", "chromium"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                # 如果命令成功且输出包含 "already installed" 或类似信息
+                return result.returncode == 0
+        except Exception:
+            # 备用方案：检查常见安装路径
+            return self._check_playwright_chromium_path()
+
+    def _check_playwright_chromium_path(self) -> bool:
+        """通过文件系统检查 Playwright Chromium 是否已安装"""
+        import platform
+        from pathlib import Path
+
+        system = platform.system().lower()
+        if system == "darwin":
+            # macOS: ~/Library/Caches/ms-playwright/
+            cache_dir = Path.home() / "Library" / "Caches" / "ms-playwright"
+        elif system == "windows":
+            # Windows: %LOCALAPPDATA%\ms-playwright
+            import os
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            cache_dir = Path(local_app_data) / "ms-playwright" if local_app_data else Path()
+        else:
+            # Linux: ~/.cache/ms-playwright
+            cache_dir = Path.home() / ".cache" / "ms-playwright"
+
+        if not cache_dir.exists():
+            return False
+
+        # 检查是否有 chromium 目录
+        for item in cache_dir.iterdir():
+            if item.is_dir() and "chromium" in item.name.lower():
+                return True
+        return False
 
     def _files(self) -> list[dict[str, Any]]:
         checks = [
@@ -158,23 +206,6 @@ class EnvironmentCheckService:
 
     def _result(self, name: str, ok: bool, detail: str, suggestion: str) -> dict[str, Any]:
         return {"name": name, "ok": ok, "detail": detail, "suggestion": suggestion}
-
-    def _chrome_path(self) -> Path | None:
-        for name in ("chrome", "chrome.exe", "Google Chrome"):
-            found = shutil.which(name)
-            if found:
-                return Path(found)
-        if platform.system().lower().startswith("windows"):
-            for root in ("ProgramFiles", "ProgramFiles(x86)", "LocalAppData"):
-                base = Path(os.environ.get(root, ""))
-                for relative in (
-                    Path("Google/Chrome/Application/chrome.exe"),
-                    Path("Google/Chrome Beta/Application/chrome.exe"),
-                ):
-                    candidate = base / relative
-                    if candidate.exists():
-                        return candidate
-        return None
 
 
 def _configured_secret(value: str | None) -> bool:

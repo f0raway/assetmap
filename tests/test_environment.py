@@ -11,7 +11,8 @@ def test_configured_secret_rejects_placeholders():
     assert _configured_secret("real-token")
 
 
-def test_environment_check_reports_configured_and_disabled_states(tmp_path: Path):
+def test_environment_check_reports_configured_and_disabled_states(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("assetmap.services.environment._module_available", lambda module: False if module == "playwright.sync_api" else True)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.enscan.script = str(tmp_path / "tyc.py")
     config.tools.wordlist = str(tmp_path / "Subdomain.txt")
@@ -29,7 +30,9 @@ def test_environment_check_reports_configured_and_disabled_states(tmp_path: Path
     assert results["ai"]["detail"] == "disabled"
     assert results["fofa"]["ok"] is True
     assert results["fofa"]["detail"] == "disabled"
-    assert results["browser"]["ok"] is True
+    browser = next(row for row in results.values() if row["name"].startswith("browser:"))
+    assert browser["ok"] is False
+    assert browser["detail"] == "playwright not installed"
 
 
 def test_environment_check_requires_fofa_when_enabled(tmp_path: Path):

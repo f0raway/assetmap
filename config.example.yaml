@@ -17,10 +17,11 @@ tools:
   tools_dir: tools
   subdomain_tools_enabled:
   - subfinder
-  - ksubdomain
+  - dnsx
   subdomain_tool_timeout_seconds: 300
+  subdomain_tool_max_output_lines: 10000
   subfinder_command: '{binary} -d {domain} -silent -all -o {output}'
-  ksubdomain_command: '{binary} enum -d {domain} -f {wordlist} --silent --output-type txt -o {output}'
+  dnsx_command: '{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc'
   wordlist: data/wordlists/1.txt
   nmap_command: '{binary} -Pn --top-ports 100 --open -sV --version-intensity 2 --min-hostgroup
     24 --min-rate 800 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout
@@ -57,14 +58,11 @@ dns:
   max_workers: 20
 ai:
   enabled: true
-  base_url: https://your-model-gateway.example.com/v1
-  api_key: YOUR_API_KEY
-  api_key_header: api-key
-  model: mimo-v2.5
+  base_url: https://api.openai.com/v1
+  api_key: YOUR_OPENAI_API_KEY
+  api_key_header: Authorization
+  model: gpt-4o
   timeout_seconds: 240
-  max_dns_records: 2000
-  max_prompt_chars: 160000
-  max_completion_tokens: 4096
 web_probe:
   timeout_seconds: 8.0
   max_workers: 20
@@ -78,7 +76,7 @@ url_discovery:
   ai_timeout_seconds: 90
   visual_max_pages: 50
   screenshot_dir: data/screenshots
-  browser_channel: chrome
+  browser_channel: ""  # 空字符串表示使用 Playwright 自带 Chromium
   browser_headless: true
   browser_wait_until: domcontentloaded
   browser_wait_after_load_ms: 1500

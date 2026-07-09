@@ -3,10 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+PUBLIC_CONFIG_EXCLUDE = {
+    "ai": {
+        "max_dns_records",
+        "max_prompt_chars",
+        "max_completion_tokens",
+    }
+}
 
 
 class DatabaseConfig(BaseModel):
@@ -20,10 +27,11 @@ class OrgConfig(BaseModel):
 
 class ToolCommandConfig(BaseModel):
     tools_dir: str = "tools"
-    subdomain_tools_enabled: list[str] = Field(default_factory=lambda: ["subfinder", "ksubdomain"])
+    subdomain_tools_enabled: list[str] = Field(default_factory=lambda: ["subfinder", "dnsx"])
     subdomain_tool_timeout_seconds: int = 300
+    subdomain_tool_max_output_lines: int = 10000
     subfinder_command: str = "{binary} -d {domain} -silent -all -o {output}"
-    ksubdomain_command: str = "{binary} enum -d {domain} -f {wordlist} --silent --output-type txt -o {output}"
+    dnsx_command: str = "{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc"
     wordlist: str = "data/wordlists/Subdomain.txt"
     nmap_command: str = (
         "{binary} -Pn --top-ports 100 --open -sV --version-intensity 2 "
@@ -42,6 +50,11 @@ class ToolCommandConfig(BaseModel):
     nmap_timeout_seconds: int = 600
     nmap_service_detect_command: str = "{binary} -Pn -sV --version-intensity 5 -p {ports} {target} -oX {xml_output} -oN {normal_output}"
 
+    @field_validator("tools_dir", "subfinder_command", "dnsx_command", "wordlist", "nmap_command", "nmap_mode", "nmap_batch_command", "nmap_service_detect_command")
+    @classmethod
+    def strip_text_fields(cls, value: str) -> str:
+        return value.strip()
+
 
 class PortScanConfig(BaseModel):
     sources_enabled: list[str] = Field(default_factory=lambda: ["nmap"])
@@ -57,6 +70,11 @@ class FofaConfig(BaseModel):
     full: bool = False
     timeout_seconds: int = 30
 
+    @field_validator("base_url", "email", "api_key")
+    @classmethod
+    def strip_text_fields(cls, value: str) -> str:
+        return value.strip()
+
 
 class EnscanConfig(BaseModel):
     script: str = "assetmap/collectors/tyc_invest_crawler.py"
@@ -68,6 +86,11 @@ class EnscanConfig(BaseModel):
     request_timeout_seconds: int = 20
     asset_workers: int = 1
     verbose: bool = False
+
+    @field_validator("script", "output_dir", "tycid", "auth_token")
+    @classmethod
+    def strip_text_fields(cls, value: str) -> str:
+        return value.strip()
 
 
 class WebProbeConfig(BaseModel):
@@ -87,7 +110,7 @@ class UrlDiscoveryConfig(BaseModel):
     ai_timeout_seconds: int = 90
     visual_max_pages: int = 50
     screenshot_dir: str = "data/screenshots"
-    browser_channel: str = "chrome"
+    browser_channel: str = ""  # 空字符串表示使用 Playwright 自带 Chromium
     browser_headless: bool = True
     browser_wait_until: str = "domcontentloaded"
     browser_wait_after_load_ms: int = 1500
@@ -104,17 +127,37 @@ class DnsConfig(BaseModel):
     nameservers: list[str] = Field(default_factory=list)
     max_workers: int = 20
 
+    @field_validator("lifetime_seconds")
+    @classmethod
+    def clamp_lifetime_seconds(cls, value: float) -> float:
+        return min(max(value, 1.0), 60.0)
+
+    @field_validator("nameservers")
+    @classmethod
+    def strip_nameservers(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item.strip()]
+
 
 class AiConfig(BaseModel):
     enabled: bool = False
-    base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
-    api_key: str = "YOUR_MIMO_API_KEY"
-    api_key_header: str = "api-key"
-    model: str = "mimo-v2.5"
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = "YOUR_OPENAI_API_KEY"
+    api_key_header: str = "Authorization"
+    model: str = "gpt-4o"
     timeout_seconds: int = 120
     max_dns_records: int = 2000
     max_prompt_chars: int = 60000
     max_completion_tokens: int = 4096
+
+    @field_validator("base_url", "api_key", "api_key_header", "model")
+    @classmethod
+    def strip_text_fields(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("max_completion_tokens")
+    @classmethod
+    def clamp_max_completion_tokens(cls, value: int) -> int:
+        return min(max(value, 256), 8192)
 
 
 class AppConfig(BaseModel):
@@ -138,12 +181,17 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     return AppConfig.model_validate(data)
 
 
+def public_config_dump(config: AppConfig) -> dict:
+    """Return the user-facing config shape written to config.yaml."""
+    return config.model_dump(mode="json", exclude=PUBLIC_CONFIG_EXCLUDE)
+
+
 def write_sample_config(path: Path | str = DEFAULT_CONFIG_PATH, overwrite: bool = True) -> Path:
     file_path = Path(path)
     if file_path.exists() and not overwrite:
         return file_path
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    content = AppConfig().model_dump(mode="json")
+    content = public_config_dump(AppConfig())
     file_path.write_text(
         yaml.safe_dump(content, sort_keys=False, allow_unicode=True),
         encoding="utf-8",

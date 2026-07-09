@@ -22,13 +22,16 @@ Thumbs.db
 
 # Local sensitive config
 config.yaml
+config_*.yaml
 ksubdomain.yaml
 .env
 .env.*
 *.local
 
 # Local tool metadata
+tools/
 tools/**/.source_repo
+resume.cfg
 
 # Generated project data
 data/*
@@ -36,5 +39,6 @@ data/*
 !data/wordlists/
 !data/wordlists/**
 
+reports/
 deliveries/
 exports/

@@ -914,3 +914,50 @@ def test_port_targets_exclude_dns_parking_cname_records(tmp_path: Path):
     by_source = NmapScanService(session, config)._targets_by_source(1)
 
     assert by_source["dns_public"] == ["8.8.4.4"]
+
+
+def test_port_targets_exclude_external_cname_records(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(
+        DnsRecord(
+            scan_task_id=1,
+            fqdn="cdn.example.cn",
+            root_domain="example.cn",
+            record_type="CNAME",
+            value="cdn.vendor.example.com",
+        )
+    )
+    session.add(
+        DnsRecord(
+            scan_task_id=1,
+            fqdn="cdn.example.cn",
+            root_domain="example.cn",
+            record_type="A",
+            value="8.8.8.8",
+        )
+    )
+    session.add(
+        DnsRecord(
+            scan_task_id=1,
+            fqdn="www.example.cn",
+            root_domain="example.cn",
+            record_type="CNAME",
+            value="example.cn",
+        )
+    )
+    session.add(
+        DnsRecord(
+            scan_task_id=1,
+            fqdn="www.example.cn",
+            root_domain="example.cn",
+            record_type="A",
+            value="8.8.4.4",
+        )
+    )
+    session.commit()
+
+    by_source = NmapScanService(session, config)._targets_by_source(1)
+
+    assert by_source["dns_public"] == ["8.8.4.4"]

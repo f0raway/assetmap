@@ -115,6 +115,44 @@ def test_fofa_host_is_used_as_web_probe_candidate(tmp_path: Path):
     assert service._fofa_hosts_by_port(1) == {("8.8.8.8", 443): ["portal.example.cn"]}
 
 
+def test_probe_hosts_advances_to_unprobed_domain_batch(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.web_probe.max_domains_per_ip = 1
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    port = NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=80, state="open")
+    session.add(
+        WebProbeResult(
+            scan_task_id=1,
+            target_ip="8.8.8.8",
+            port=80,
+            scheme="http",
+            host="8.8.8.8",
+            url="http://8.8.8.8/",
+        )
+    )
+    session.add(
+        WebProbeResult(
+            scan_task_id=1,
+            target_ip="8.8.8.8",
+            port=80,
+            scheme="https",
+            host="8.8.8.8",
+            url="https://8.8.8.8/",
+        )
+    )
+    session.commit()
+
+    hosts = AssetClassifierService(session, config)._probe_hosts(
+        1,
+        port,
+        {"8.8.8.8": ["a.example.cn", "b.example.cn"]},
+        {},
+    )
+
+    assert hosts == ["a.example.cn", "b.example.cn"]
+
+
 def test_obvious_non_web_ports_are_not_web_probed(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)

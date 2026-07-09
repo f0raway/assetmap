@@ -19,6 +19,7 @@ dependencies = [
   "requests>=2.32,<2.33",
   "sqlmodel>=0.0.34,<0.1",
   "typer>=0.23,<0.24",
+  "questionary>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]

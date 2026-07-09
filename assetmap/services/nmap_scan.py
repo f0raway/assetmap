@@ -499,13 +499,18 @@ class NmapScanService:
             for row in rows
             if row.record_type == "CNAME" and self._is_parking_cname(row.value)
         }
+        external_cname_hosts = {
+            row.fqdn
+            for row in rows
+            if row.record_type == "CNAME" and not self._is_same_root_cname(row.value, row.root_domain)
+        }
         targets: list[str] = []
         for row in rows:
             if row.record_type not in {"A", "AAAA"}:
                 continue
             if (row.raw_payload or {}).get("kind") == "manual_ip":
                 continue
-            if row.fqdn in parked_hosts:
+            if row.fqdn in parked_hosts or row.fqdn in external_cname_hosts:
                 continue
             if _is_real_public_ip(row.value) and row.value not in targets:
                 targets.append(row.value)
@@ -514,6 +519,11 @@ class NmapScanService:
     def _is_parking_cname(self, value: str) -> bool:
         text = value.lower().rstrip(".")
         return any(keyword in text for keyword in PARKING_CNAME_KEYWORDS)
+
+    def _is_same_root_cname(self, value: str, root_domain: str) -> bool:
+        cname = value.lower().rstrip(".")
+        root = root_domain.lower().rstrip(".")
+        return cname == root or cname.endswith(f".{root}")
 
     def _get_or_create_task(self, scan_task_id: int) -> NmapScanTask:
         task = self.session.exec(

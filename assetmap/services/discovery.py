@@ -216,18 +216,97 @@ class DiscoveryService:
         else:
             if not target:
                 raise ValueError("Target is required unless --resume-task is used.")
-            task = None if refresh else self._latest_task_for_target(target)
-            if task:
-                self._log(f"[task {task.id}] resume latest task for target: {target}")
+
+            latest_task = None if refresh else self._latest_task_for_target(target)
+            if latest_task and latest_task.status != "completed":
+                task = latest_task
                 task.status = "running"
                 task.error_message = None
                 task.finished_at = None
+                self._log(f"[task] resume interrupted task_{task.id}")
             else:
-                task = ScanTask(target=target, status="running")
+                # 已完成任务进入增量积累模式：创建新任务并继承历史数据。
+                previous_task = latest_task if latest_task and latest_task.status == "completed" else None
+
+                if previous_task:
+                    self._log(f"[task] 检测到历史任务 task_{previous_task.id} ({previous_task.finished_at.strftime('%Y-%m-%d') if previous_task.finished_at else 'unknown'} 完成)")
+
+                    task = ScanTask(target=target, status="running")
+                    self.session.add(task)
+                    self.session.commit()
+                    self.session.refresh(task)
+
+                    inherited = self._inherit_historical_data(previous_task.id, task.id)
+                    self._log(f"[task] 继承历史数据: {inherited['companies']} 公司, {inherited['edges']} 股权关系, {inherited['assets']} 资产")
+                else:
+                    # 全新任务
+                    task = ScanTask(target=target, status="running")
+
         self.session.add(task)
         self.session.commit()
         self.session.refresh(task)
         return task
+
+    def _latest_completed_task_for_target(self, target: str) -> ScanTask | None:
+        """查找同名目标最近一次已完成的任务"""
+        return self.session.exec(
+            select(ScanTask)
+            .where(
+                ScanTask.target == target,
+                ScanTask.status == "completed",
+            )
+            .order_by(ScanTask.finished_at.desc())
+        ).first()
+
+    def _inherit_historical_data(self, from_task_id: int, to_task_id: int) -> dict[str, int]:
+        """从历史任务继承数据到新任务"""
+        inherited = {"companies": 0, "edges": 0, "assets": 0}
+
+        # 1. 继承公司股权关系（CompanyEdge）
+        old_edges = self.session.exec(
+            select(CompanyEdge).where(CompanyEdge.task_id == from_task_id)
+        ).all()
+
+        for old_edge in old_edges:
+            new_edge = CompanyEdge(
+                task_id=to_task_id,
+                parent_company_id=old_edge.parent_company_id,
+                child_company_id=old_edge.child_company_id,
+                direct_holding_ratio=old_edge.direct_holding_ratio,
+                cumulative_holding_ratio=old_edge.cumulative_holding_ratio,
+                depth=old_edge.depth,
+                path=old_edge.path,
+            )
+            self.session.add(new_edge)
+            inherited["edges"] += 1
+
+        # 2. 继承资产关联（CompanyAssetLink）
+        old_links = self.session.exec(
+            select(CompanyAssetLink).where(CompanyAssetLink.task_id == from_task_id)
+        ).all()
+
+        for old_link in old_links:
+            new_link = CompanyAssetLink(
+                task_id=to_task_id,
+                company_id=old_link.company_id,
+                asset_id=old_link.asset_id,
+                source_tool=old_link.source_tool,
+                raw_payload=old_link.raw_payload,
+            )
+            self.session.add(new_link)
+            inherited["assets"] += 1
+
+        # 3. 统计继承的公司数量
+        company_ids = set()
+        for edge in old_edges:
+            company_ids.add(edge.parent_company_id)
+            company_ids.add(edge.child_company_id)
+        for link in old_links:
+            company_ids.add(link.company_id)
+        inherited["companies"] = len(company_ids)
+
+        self.session.commit()
+        return inherited
 
     def _latest_task_for_target(self, target: str) -> ScanTask | None:
         return self.session.exec(
@@ -240,15 +319,17 @@ class DiscoveryService:
         output_path = (Path(self.config.enscan.output_dir) / f"task_{task_id}.json").resolve()
         csv_dir = output_path.with_suffix("")
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        tycid = self.config.enscan.tycid.strip()
+        auth_token = self.config.enscan.auth_token.strip()
         command = [
             sys.executable,
             str(Path(self.config.enscan.script)),
             "--name",
             target,
             "--tycid",
-            self.config.enscan.tycid,
+            tycid,
             "--auth-token",
-            self.config.enscan.auth_token,
+            auth_token,
             "--output",
             str(output_path),
             "--csv-dir",
@@ -268,7 +349,7 @@ class DiscoveryService:
             command.append("--fresh")
         if self.config.enscan.verbose:
             command.append("--verbose")
-        if self.config.enscan.tycid.startswith("YOUR_") or self.config.enscan.auth_token.startswith("YOUR_"):
+        if tycid.startswith("YOUR_") or auth_token.startswith("YOUR_"):
             raise ValueError("Please set enscan.tycid and enscan.auth_token in config.yaml before running discover.")
         safe_command = _redact_command(command)
         self._log(f"[enscan] running: {' '.join(safe_command)}")

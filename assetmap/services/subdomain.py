@@ -7,10 +7,12 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import dns.exception
 import dns.resolver
+import httpx
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -32,9 +34,16 @@ from assetmap.utils import stable_hash
 
 MAIN_RECORD_TYPES = ("A", "AAAA", "CNAME", "NS", "MX", "TXT", "SOA")
 SUBDOMAIN_RECORD_TYPES = ("A", "AAAA", "CNAME")
-SUPPORTED_SUBDOMAIN_TOOLS = {"subfinder", "ksubdomain"}
+SUPPORTED_SUBDOMAIN_TOOLS = {"subfinder", "dnsx"}
 INTERRUPTED_EXIT_CODES = {3221225786, -1073741510}
 INTERRUPTED_ERROR_MARKERS = ("^c", "keyboardinterrupt", "interrupted", "ctrl+c", "control-c")
+DNS_AI_BATCH_MAX_RECORDS = 1000
+DNS_AI_BATCH_MAX_CHARS = 45000
+DOH_ENDPOINTS = (
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+)
+DOH_RECORD_TYPES = {"A": 1, "AAAA": 28, "CNAME": 5}
 
 
 def _utcnow() -> datetime:
@@ -146,6 +155,7 @@ class SubdomainService:
             if rerun_dns:
                 self._clear_dns_results(scan_task_id)
             self._parse_tool_outputs(scan_task_id, root_domains)
+            self._log_discovered_subdomains(scan_task_id)
 
             task.stage = "dns_main"
             self.session.add(task)
@@ -259,6 +269,17 @@ class SubdomainService:
         ).all()
         return sorted({row.fqdn for row in rows})
 
+    def _log_discovered_subdomains(self, scan_task_id: int) -> None:
+        subdomains = self._subdomains(scan_task_id)
+        output_dir = Path("data") / "subdomains" / f"task_{scan_task_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "discovered_subdomains.txt"
+        path.write_text("\n".join(subdomains) + ("\n" if subdomains else ""), encoding="utf-8")
+        self._log(f"[subdomain] discovered subdomains before DNS: {len(subdomains)}")
+        for index in range(0, len(subdomains), 20):
+            self._log(f"[subdomain] discovered: {', '.join(subdomains[index:index + 20])}")
+        self._log(f"[subdomain] discovered subdomain list: {path}")
+
     def _binary_path(self, tool_name: str) -> str:
         suffix = ".exe" if __import__("platform").system().lower().startswith("windows") else ""
         path = Path(self.config.tools.tools_dir) / tool_name / f"{tool_name}{suffix}"
@@ -333,15 +354,24 @@ class SubdomainService:
     def _enabled_subdomain_tools(self) -> list[tuple[str, str]]:
         templates = {
             "subfinder": self.config.tools.subfinder_command,
-            "ksubdomain": self.config.tools.ksubdomain_command,
+            "dnsx": self.config.tools.dnsx_command,
         }
         enabled: list[tuple[str, str]] = []
         for tool_name in self.config.tools.subdomain_tools_enabled:
-            if tool_name not in SUPPORTED_SUBDOMAIN_TOOLS:
+            normalized = tool_name.lower().strip()
+            if normalized not in SUPPORTED_SUBDOMAIN_TOOLS:
                 self._log(f"[subdomain] skip unsupported tool in config: {tool_name}")
                 continue
-            enabled.append((tool_name, templates[tool_name]))
+            enabled.append((normalized, templates[normalized]))
         return enabled
+
+    def _enabled_subdomain_tool_names(self) -> list[str]:
+        names = []
+        for tool_name in self.config.tools.subdomain_tools_enabled:
+            normalized = tool_name.lower().strip()
+            if normalized in SUPPORTED_SUBDOMAIN_TOOLS and normalized not in names:
+                names.append(normalized)
+        return names or ["__none__"]
 
     def _get_or_create_tool_run(
         self,
@@ -414,8 +444,12 @@ class SubdomainService:
             session.commit()
 
     def _log_tool_summary(self, scan_task_id: int) -> None:
+        enabled_names = self._enabled_subdomain_tool_names()
         runs = self.session.exec(
-            select(SubdomainToolRun).where(SubdomainToolRun.scan_task_id == scan_task_id)
+            select(SubdomainToolRun).where(
+                SubdomainToolRun.scan_task_id == scan_task_id,
+                SubdomainToolRun.tool_name.in_(enabled_names),
+            )
         ).all()
         if not runs:
             return
@@ -488,10 +522,14 @@ class SubdomainService:
     def _write_subdomain_audit(self, scan_task_id: int, root_domains: list[str] | None = None) -> Path:
         root_domains = root_domains or self._root_domains(scan_task_id)
         root_set = set(root_domains)
+        enabled_names = self._enabled_subdomain_tool_names()
         output_dir = Path("data") / "subdomains" / f"task_{scan_task_id}"
         output_dir.mkdir(parents=True, exist_ok=True)
         runs = self.session.exec(
-            select(SubdomainToolRun).where(SubdomainToolRun.scan_task_id == scan_task_id)
+            select(SubdomainToolRun).where(
+                SubdomainToolRun.scan_task_id == scan_task_id,
+                SubdomainToolRun.tool_name.in_(enabled_names),
+            )
         ).all()
         subdomain_rows = self.session.exec(
             select(SubdomainRecord).where(SubdomainRecord.scan_task_id == scan_task_id)
@@ -570,14 +608,19 @@ class SubdomainService:
         ).all()
         before = len(self._subdomains(scan_task_id))
         dns_from_tools = 0
+        skipped_large_outputs = 0
+        max_output_lines = max(1, self.config.tools.subdomain_tool_max_output_lines)
         for run in runs:
-            lines: list[str] = []
-            output = Path(run.output_path)
-            if output.exists():
-                lines.extend(output.read_text(encoding="utf-8", errors="ignore").splitlines())
-            if run.stdout:
-                lines.extend(run.stdout.splitlines())
-            for line in lines:
+            if self._tool_output_exceeds_limit(run, max_output_lines):
+                removed = self._delete_tool_only_subdomains(scan_task_id, run.root_domain, run.tool_name)
+                skipped_large_outputs += 1
+                self._log(
+                    f"[subdomain] skipped {run.tool_name} output for {run.root_domain}: "
+                    f"more than {max_output_lines} lines, possible wildcard DNS; "
+                    f"removed_tool_only={removed}"
+                )
+                continue
+            for line in self._iter_tool_output_lines(run):
                 hostname = _tool_line_hostname(line)
                 if not hostname:
                     continue
@@ -590,6 +633,35 @@ class SubdomainService:
         self._log(f"[subdomain] merged unique subdomains: {after} (+{after - before})")
         if dns_from_tools:
             self._log(f"[dns] merged tool DNS records: {dns_from_tools}")
+        if skipped_large_outputs:
+            self._log(f"[subdomain] skipped large tool outputs: {skipped_large_outputs}")
+
+    def _tool_output_exceeds_limit(self, run: SubdomainToolRun, max_lines: int) -> bool:
+        count = 0
+        for _line in self._iter_tool_output_lines(run):
+            count += 1
+            if count > max_lines:
+                return True
+        return False
+
+    def _iter_tool_output_lines(self, run: SubdomainToolRun) -> Iterable[str]:
+        output = Path(run.output_path)
+        if output.exists():
+            with output.open("r", encoding="utf-8", errors="ignore") as handle:
+                yield from handle
+        if run.stdout:
+            yield from run.stdout.splitlines()
+
+    def _delete_tool_only_subdomains(self, scan_task_id: int, root_domain: str, tool_name: str) -> int:
+        result = self.session.exec(
+            delete(SubdomainRecord).where(
+                SubdomainRecord.scan_task_id == scan_task_id,
+                SubdomainRecord.root_domain == root_domain,
+                SubdomainRecord.sources == [tool_name],
+            )
+        )
+        self.session.commit()
+        return int(result.rowcount or 0)
 
     def _save_tool_dns_values(
         self,
@@ -638,8 +710,8 @@ class SubdomainService:
 
     def _resolver(self) -> dns.resolver.Resolver:
         resolver = dns.resolver.Resolver()
-        resolver.timeout = self.config.dns.timeout_seconds
-        resolver.lifetime = self.config.dns.lifetime_seconds
+        resolver.timeout = max(1.0, self.config.dns.timeout_seconds)
+        resolver.lifetime = min(max(1.0, self.config.dns.lifetime_seconds), 60.0)
         if self.config.dns.nameservers:
             resolver.nameservers = self.config.dns.nameservers
         return resolver
@@ -655,10 +727,13 @@ class SubdomainService:
                 jobs.append((domain, root, record_type))
         if not jobs:
             return
-        self._log(f"[dns] resolving {len(jobs)} queries")
-        workers = min(max(1, self.config.dns.max_workers), len(jobs))
+        workers = min(max(1, self.config.dns.max_workers), len(jobs), 10)
+        self._log(f"[dns] resolving {len(jobs)} queries with workers={workers}")
         saved = 0
         skipped = 0
+        completed = 0
+        total = len(jobs)
+        progress_interval = max(1, total // 10)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(self._resolve_one, scan_task_id, domain, root, record_type)
@@ -668,6 +743,9 @@ class SubdomainService:
                 result = future.result()
                 saved += result.get("saved", 0)
                 skipped += result.get("skipped", 0)
+                completed += 1
+                if completed % progress_interval == 0 or completed == total:
+                    self._log(f"[dns] progress: {completed}/{total} queries completed")
         self._log(f"[dns] resolved records saved={saved}, skipped_non_public={skipped}")
 
     def _root_for_domain(self, scan_task_id: int, fqdn: str) -> str:
@@ -684,7 +762,6 @@ class SubdomainService:
         ).first()
 
     def _resolve_one(self, scan_task_id: int, fqdn: str, root_domain: str, record_type: str) -> dict[str, int]:
-        resolver = self._resolver()
         saved = 0
         skipped = 0
         with Session(self.session.get_bind()) as session:
@@ -703,6 +780,36 @@ class SubdomainService:
                     record_type=record_type,
                 )
             try:
+                doh_result = self._resolve_doh_records(fqdn, record_type)
+                if doh_result["completed"]:
+                    for record in doh_result["records"]:
+                        value = str(record["value"])
+                        if record_type in {"A", "AAAA"} and not _is_public_ip(value):
+                            skipped += 1
+                            continue
+                        if self._upsert_dns_record(
+                            session,
+                            scan_task_id,
+                            fqdn,
+                            root_domain,
+                            record_type,
+                            value,
+                            ttl=record.get("ttl"),
+                            raw_payload={
+                                "source": "doh",
+                                "endpoint": record.get("endpoint"),
+                                "text": value,
+                            },
+                        ):
+                            saved += 1
+                    status.status = "completed"
+                    status.error_message = str(doh_result.get("error") or "")[:1000] or None
+                    status.queried_at = _utcnow()
+                    session.add(status)
+                    session.commit()
+                    return {"saved": saved, "skipped": skipped}
+
+                resolver = self._resolver()
                 answer = resolver.resolve(fqdn, record_type)
                 for item in answer:
                     value = self._format_dns_value(record_type, item)
@@ -732,6 +839,53 @@ class SubdomainService:
             session.add(status)
             session.commit()
         return {"saved": saved, "skipped": skipped}
+
+    def _resolve_doh_records(self, fqdn: str, record_type: str) -> dict[str, Any]:
+        if record_type not in DOH_RECORD_TYPES:
+            return {"completed": False, "records": [], "error": None}
+        errors = []
+        doh_timeout = min(self.config.dns.lifetime_seconds, 10.0)
+        for endpoint in DOH_ENDPOINTS:
+            try:
+                with httpx.Client(timeout=doh_timeout, trust_env=False) as client:
+                    response = client.get(
+                        endpoint,
+                        params={"name": fqdn, "type": record_type},
+                        headers={"Accept": "application/dns-json"},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                errors.append(f"{endpoint}: {exc}")
+                continue
+
+            status = payload.get("Status")
+            records = self._doh_answer_records(payload, record_type, endpoint)
+            if status == 0:
+                error = None if records else f"DoH no {record_type} answer"
+                return {"completed": True, "records": records, "error": error}
+            if status == 3:
+                return {"completed": True, "records": [], "error": "DoH NXDOMAIN"}
+            errors.append(f"{endpoint}: DoH status={status}")
+        return {"completed": False, "records": [], "error": "; ".join(errors)}
+
+    def _doh_answer_records(self, payload: dict[str, Any], record_type: str, endpoint: str) -> list[dict[str, Any]]:
+        expected_type = DOH_RECORD_TYPES[record_type]
+        records = []
+        for answer in payload.get("Answer") or []:
+            if answer.get("type") != expected_type:
+                continue
+            value = str(answer.get("data") or "").rstrip(".")
+            if not value:
+                continue
+            records.append(
+                {
+                    "value": value,
+                    "ttl": answer.get("TTL"),
+                    "endpoint": endpoint,
+                }
+            )
+        return records
 
     def _format_dns_value(self, record_type: str, item) -> str:
         if record_type in {"A", "AAAA", "CNAME", "NS"}:
@@ -772,11 +926,11 @@ class SubdomainService:
             return False
 
     def _run_ai_analysis(self, scan_task_id: int) -> None:
-        payload = self._ai_payload(scan_task_id)
-        if not payload["dns_records"]:
+        payloads = self._ai_payloads(scan_task_id)
+        if not payloads:
             self._log("[ai] skip: no DNS records")
             return
-        fingerprint = stable_hash(payload)
+        fingerprint = stable_hash({"schema_version": 3, "batches": payloads})
         row = self.session.exec(
             select(AiAnalysis).where(
                 AiAnalysis.scan_task_id == scan_task_id,
@@ -791,14 +945,25 @@ class SubdomainService:
         ):
             self._log("[ai] skip cached DNS inference")
             return
-        response = self._call_ai(self.config.ai, payload)
-        summary = response.get("choices", [{}])[0].get("message", {}).get("content")
+        responses = []
+        summaries = []
+        for index, payload in enumerate(payloads, start=1):
+            if len(payloads) > 1:
+                self._log(f"[ai] DNS inference batch {index}/{len(payloads)} records={len(payload['dns_records'])}")
+            response = self._call_ai(self.config.ai, payload)
+            responses.append(response)
+            summaries.append(response.get("choices", [{}])[0].get("message", {}).get("content") or "")
+        summary = summaries[0] if len(summaries) == 1 else self._merge_dns_ai_summaries(summaries)
         if not row:
             row = AiAnalysis(scan_task_id=scan_task_id, analysis_type="dns_inference")
         row.status = "completed"
         row.model = self.config.ai.model
-        row.prompt_json = {"fingerprint": fingerprint, **payload}
-        row.response_json = response
+        if len(payloads) == 1:
+            row.prompt_json = {"fingerprint": fingerprint, **payloads[0]}
+            row.response_json = responses[0]
+        else:
+            row.prompt_json = {"fingerprint": fingerprint, "schema_version": 3, "batch_count": len(payloads), "batches": payloads}
+            row.response_json = {"batches": responses}
         row.summary = summary
         row.updated_at = _utcnow()
         self.session.add(row)
@@ -806,32 +971,45 @@ class SubdomainService:
         self._log("[ai] analysis completed")
 
     def _ai_payload(self, scan_task_id: int) -> dict:
+        payloads = self._ai_payloads(scan_task_id)
+        return payloads[0] if payloads else {"dns_records": []}
+
+    def _ai_payloads(self, scan_task_id: int) -> list[dict]:
         roots = self._root_domains(scan_task_id)
         records = self.session.exec(
             select(DnsRecord).where(DnsRecord.scan_task_id == scan_task_id)
         ).all()
-        compact_records, truncated = self._compact_dns_records(records)
-        return {
-            "schema_version": 2,
-            "scan_task_id": scan_task_id,
-            "root_domains": roots,
-            "record_format": "fqdn|type|value",
-            "dns_records": compact_records,
-            "dns_records_truncated": truncated,
-            "candidate_public_ip_evidence": self._candidate_ip_evidence(records),
-            "instructions": (
-                "Identify likely real public server IPs for nmap scanning. Exclude IPs that only "
-                "belong to NS infrastructure, obvious CDN/CNAME access, WAF/proxy ranges, or test/"
-                "documentation/private/reserved ranges. You must start with a machine-readable "
-                "NMAP_TARGET_IPS block, then provide concise Chinese analysis."
-            ),
-        }
+        if not records:
+            return []
+        batches = self._dns_record_batches(records)
+        payloads = []
+        for index, batch_records in enumerate(batches, start=1):
+            payloads.append(
+                {
+                    "schema_version": 3,
+                    "scan_task_id": scan_task_id,
+                    "batch_index": index,
+                    "batch_count": len(batches),
+                    "root_domains": roots,
+                    "record_format": "fqdn|type|value",
+                    "dns_records": self._dns_record_lines(batch_records),
+                    "dns_records_truncated": False,
+                    "candidate_public_ip_evidence": self._candidate_ip_evidence(batch_records),
+                    "instructions": (
+                        "Identify likely real public server IPs for nmap scanning in this batch. Exclude IPs that only "
+                        "belong to NS infrastructure, obvious CDN/CNAME access, WAF/proxy ranges, or test/"
+                        "documentation/private/reserved ranges. You must start with a machine-readable "
+                        "NMAP_TARGET_IPS block, then provide concise Chinese analysis."
+                    ),
+                }
+            )
+        return payloads
 
-    def _compact_dns_records(self, records: list[DnsRecord]) -> tuple[list[str], bool]:
+    def _dns_record_lines(self, records: list[DnsRecord]) -> list[str]:
         priority = {"A": 0, "AAAA": 1, "CNAME": 2, "MX": 3, "TXT": 4, "NS": 5, "SOA": 6}
-        lines = sorted(
+        return sorted(
             {
-                f"{record.fqdn}|{record.record_type}|{record.value}"
+                self._dns_record_line(record)
                 for record in records
             },
             key=lambda line: (
@@ -840,17 +1018,65 @@ class SubdomainService:
                 line,
             ),
         )
-        selected: list[str] = []
+
+    def _dns_record_line(self, record: DnsRecord) -> str:
+        return f"{record.fqdn}|{record.record_type}|{record.value}"
+
+    def _dns_record_batches(self, records: list[DnsRecord]) -> list[list[DnsRecord]]:
+        ordered = sorted(records, key=lambda record: self._dns_record_lines([record])[0])
+        batches: list[list[DnsRecord]] = []
+        current: list[DnsRecord] = []
         used_chars = 0
-        max_records = max(1, self.config.ai.max_dns_records)
-        max_chars = max(1000, self.config.ai.max_prompt_chars)
-        for line in lines:
+        for record in ordered:
+            line = self._dns_record_line(record)
             next_chars = used_chars + len(line) + 1
-            if len(selected) >= max_records or next_chars > max_chars:
-                return selected, True
-            selected.append(line)
+            if current and (len(current) >= DNS_AI_BATCH_MAX_RECORDS or next_chars > DNS_AI_BATCH_MAX_CHARS):
+                batches.append(current)
+                current = []
+                used_chars = 0
+                next_chars = len(line) + 1
+            current.append(record)
             used_chars = next_chars
-        return selected, False
+        if current:
+            batches.append(current)
+        return batches
+
+    def _merge_dns_ai_summaries(self, summaries: list[str]) -> str:
+        lines_by_ip: dict[str, str] = {}
+        details = []
+        for index, summary in enumerate(summaries, start=1):
+            for line in self._nmap_target_lines(summary):
+                ip = self._first_public_ip(line)
+                if ip and ip not in lines_by_ip:
+                    lines_by_ip[ip] = line
+            details.append(f"批次 {index}:\n{summary}".strip())
+        target_lines = list(lines_by_ip.values())
+        return "\n".join(
+            [
+                "NMAP_TARGET_IPS",
+                *target_lines,
+                "END_NMAP_TARGET_IPS",
+                "",
+                "分批 DNS AI 分析明细：",
+                *details,
+            ]
+        )
+
+    def _nmap_target_lines(self, summary: str) -> list[str]:
+        match = re.search(r"NMAP_TARGET_IPS\s*(.*?)\s*END_NMAP_TARGET_IPS", summary or "", flags=re.I | re.S)
+        segment = match.group(1) if match else summary or ""
+        lines = []
+        for line in segment.splitlines():
+            if self._first_public_ip(line):
+                lines.append(line.strip())
+        return lines
+
+    def _first_public_ip(self, text: str) -> str | None:
+        for match in re.finditer(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", text):
+            value = match.group(0)
+            if _is_public_ip(value):
+                return value
+        return None
 
     def _candidate_ip_evidence(self, records: list[DnsRecord]) -> list[dict]:
         cname_by_fqdn: dict[str, list[str]] = {}
@@ -911,4 +1137,4 @@ class SubdomainService:
                 "content": json.dumps(payload, ensure_ascii=False),
             },
         ]
-        return chat_completion(config, messages, temperature=0.1)
+        return chat_completion(config, messages, temperature=0.1, max_completion_tokens=1600)

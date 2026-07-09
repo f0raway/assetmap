@@ -332,4 +332,5 @@ class ReviewWorkOrderService:
     def _package_screenshot_path(self, screenshot: Any) -> str:
         if not screenshot:
             return ""
-        return f"screenshots/{Path(str(screenshot)).name}"
+        name = str(screenshot).replace("\\", "/").rstrip("/").split("/")[-1]
+        return f"screenshots/{name}" if name else ""
