@@ -1,6 +1,6 @@
-from assetmap.services.nmap_scan import extract_ai_marked_service_ips
+from assetmap.services.mapping.nmap_scan import extract_ai_marked_service_ips
 from assetmap.config import FofaConfig
-from assetmap.services.fofa import FofaClient
+from assetmap.services.mapping.fofa import FofaClient
 from assetmap.utils import extract_percent
 
 

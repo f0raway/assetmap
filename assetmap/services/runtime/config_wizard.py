@@ -10,7 +10,7 @@ import yaml
 from questionary import Style
 
 from assetmap.config import AppConfig, DEFAULT_CONFIG_PATH, load_config, public_config_dump
-from assetmap.services.environment import _configured_secret
+from assetmap.services.runtime.environment import _configured_secret
 
 
 # 自定义样式
@@ -236,9 +236,7 @@ class ConfigWizardService:
         self._ask_text("tools", "subfinder_command", "subdomains 阶段执行 subfinder 的命令模板，支持 {binary}/{domain}/{output}。")
         self._ask_text("tools", "dnsx_command", "subdomains 阶段执行 dnsx 的命令模板，支持 {binary}/{domain}/{wordlist}/{output}。")
         self._ask_text("tools", "wordlist", "dnsx 爆破子域名时使用的字典路径，env-check 也会检查它是否存在。")
-        self._ask_text("tools", "nmap_command", "单目标主动端口扫描命令模板，支持 {binary}/{target}/{xml_output}/{normal_output}。")
-        self._ask_choice("tools", "nmap_mode", "nmap_scan 根据该值选择批量扫描 batch 或逐目标扫描 single。", ["batch", "single"])
-        self._ask_text("tools", "nmap_batch_command", "批量主动端口扫描命令模板，batch 模式使用，支持 {targets_file}/{xml_output}/{normal_output}。")
+        self._ask_text("tools", "nmap_command", "批量主动端口扫描命令模板，支持 {binary}/{targets_file}/{xml_output}/{normal_output}。")
         self._ask_int("tools", "nmap_max_workers", "single 模式下并发执行 nmap 的最大 worker 数。")
         self._ask_int("tools", "nmap_timeout_seconds", "nmap 扫描和服务识别命令的超时时间。")
         self._ask_text("tools", "nmap_service_detect_command", "classify 阶段对已知端口补充服务识别时使用的 nmap 命令模板。")

@@ -8,15 +8,15 @@ import typer
 
 from assetmap.config import DEFAULT_CONFIG_PATH, load_config
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.services.manual_import import (
+from assetmap.services.acquisition.manual_import import (
     DEFAULT_MANUAL_ASSET_TEMPLATE_PATH,
     ManualAssetImportService,
     write_manual_asset_template,
 )
-from assetmap.services.gap_template import GapTemplateService
-from assetmap.services.exporter import ExportService
-from assetmap.services.maintenance import MaintenanceService
-from assetmap.services.manual_asset_wizard import ManualAssetWizardService
+from assetmap.services.operations.gap_template import GapTemplateService
+from assetmap.services.delivery.exporter import ExportService
+from assetmap.services.operations.maintenance import MaintenanceService
+from assetmap.services.acquisition.manual_asset_wizard import ManualAssetWizardService
 
 from .common import _bootstrap, manual_import_next_command
 from .pipeline import _run_pipeline

@@ -8,16 +8,17 @@ import typer
 
 from assetmap.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.services.discovery import DiscoveryService
-from assetmap.services.subdomain import SubdomainService
-from assetmap.services.nmap_scan import NmapScanService
-from assetmap.services.asset_classifier import AssetClassifierService
-from assetmap.services.url_discovery import UrlDiscoveryService
-from assetmap.services.report import ReportService
-from assetmap.services.quality import DeliveryQualityService
-from assetmap.services.package import DeliveryPackageService, DeliveryPackageVerifier
-from assetmap.services.manual_import import ManualAssetImportService
-from assetmap.services.status import PipelineStatusService
+from assetmap.services.acquisition.discovery import DiscoveryService
+from assetmap.services.mapping.subdomain import SubdomainService
+from assetmap.services.mapping.nmap_scan import NmapScanService
+from assetmap.services.identification.asset_classifier import AssetClassifierService
+from assetmap.services.identification.url_discovery import UrlDiscoveryService
+from assetmap.services.delivery.report import ReportService
+from assetmap.services.delivery.quality import DeliveryQualityService
+from assetmap.services.delivery.package import DeliveryPackageService, DeliveryPackageVerifier
+from assetmap.services.acquisition.manual_import import ManualAssetImportService
+from assetmap.services.operations.status import PipelineStatusService
+from assetmap.services.runtime.environment import EnvironmentCheckService
 
 from .common import (
     _exit_interrupted,
@@ -251,6 +252,7 @@ def _run_one_click_scan(
     strict: bool = False,
     progress,
 ) -> int:
+    _require_full_scan_environment(config, progress)
     progress("[scan] 1/3 discover enterprise tree and filing assets")
     result = DiscoveryService(session, config, progress=progress).run(
         target,
@@ -316,6 +318,19 @@ def _run_one_click_scan(
         raise typer.Exit(1)
     progress("[scan] completed")
     return result.task_id
+
+
+def _require_full_scan_environment(config: AppConfig, progress) -> None:
+    """Fail before discovery when the configured full pipeline cannot run."""
+    failures = [row for row in EnvironmentCheckService(config).check() if not row["ok"]]
+    if not failures:
+        return
+    progress("[scan] preflight failed; no external collection was started.")
+    for row in failures:
+        progress(f"[scan] missing {row['name']}: {row['detail']}")
+        if row["suggestion"]:
+            progress(f"[scan] suggestion: {row['suggestion']}")
+    raise typer.Exit(2)
 
 
 def _run_pipeline(
@@ -453,7 +468,7 @@ def _prompt_manual_asset_import(
         return False
     elif choice == "逐条添加资产":
         # 调用手动资产添加 TUI
-        from assetmap.services.manual_asset_wizard import ManualAssetWizardService
+        from assetmap.services.acquisition.manual_asset_wizard import ManualAssetWizardService
         wizard = ManualAssetWizardService(session, progress=progress)
         return wizard.run(task_id)
     elif choice == "从文件批量导入":
@@ -462,7 +477,7 @@ def _prompt_manual_asset_import(
             style=custom_style,
         ).ask()
         if file_path and Path(file_path).exists():
-            from assetmap.services.manual_import import ManualAssetImportService
+            from assetmap.services.acquisition.manual_import import ManualAssetImportService
             service = ManualAssetImportService(session, progress=progress)
             result = service.run(task_id, Path(file_path))
             progress(f"✓ 已导入: {result.domains} 域名, {result.subdomains} 子域名, {result.ips} IP, {result.urls} URL")

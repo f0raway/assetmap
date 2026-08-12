@@ -13,12 +13,13 @@ from assetmap.models import (
     NmapScanTask,
     ScanTask,
     SubdomainEnumerationTask,
+    SubdomainToolRun,
     UrlDiscoveryTask,
     WebEntrypoint,
 )
 from assetmap.cli import _coalesce_improve_actions, _quality_suggested_actions, _select_improve_actions, _should_run_stage
-from assetmap.services.quality import DeliveryQualityService
-from assetmap.services.status import PipelineStatusService
+from assetmap.services.delivery.quality import DeliveryQualityService
+from assetmap.services.operations.status import PipelineStatusService
 
 
 def test_pipeline_status_suggests_next_step(tmp_path: Path):
@@ -44,6 +45,63 @@ def test_pipeline_status_suggests_next_step(tmp_path: Path):
 
     assert any("discover: completed" in line for line in status.lines)
     assert status.next_step == "assetmap run <task_id> --from-stage subdomains"
+
+
+def test_pipeline_status_retries_completed_subdomain_stage_with_failed_children(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(ScanTask(id=1, target="示例集团有限公司", status="completed"))
+    company = Company(id=1, name="示例集团有限公司", normalized_name="示例集团有限公司")
+    domain = InternetAsset(
+        id=1,
+        asset_type="icp_domain",
+        normalized_identifier="example.cn",
+        display_name="example.cn",
+        raw_payload={},
+    )
+    session.add(company)
+    session.add(domain)
+    session.add(CompanyAssetLink(task_id=1, company_id=1, asset_id=1, source_tool="manual", raw_payload={}))
+    session.add(SubdomainEnumerationTask(scan_task_id=1, status="completed"))
+    session.add(
+        SubdomainToolRun(
+            scan_task_id=1,
+            root_domain="example.cn",
+            tool_name="subfinder",
+            command="subfinder",
+            output_path="subfinder.txt",
+            status="failed",
+            error_message="temporary network error",
+        )
+    )
+    session.commit()
+
+    status = PipelineStatusService(session).get(1)
+
+    assert any("subdomains: completed_with_errors" in line for line in status.lines)
+    assert status.next_step == "assetmap run <task_id> --from-stage subdomains"
+
+
+def test_quality_treats_partial_mapping_failures_as_warnings(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = DeliveryQualityService(session, config)
+
+    incomplete, warnings = service._pipeline_issues(
+        [
+            ("subdomains", "completed_with_errors", "failed_items=1"),
+            ("port-scan", "completed_with_errors", "failed_runs=1"),
+            ("report", "completed", "artifacts=ok"),
+        ]
+    )
+
+    assert incomplete == []
+    assert len(warnings) == 2
+    incomplete, warnings = service._pipeline_issues([("report", "completed_with_errors", "artifacts=missing")])
+    assert incomplete == ["report"]
+    assert warnings == []
 
 
 def test_pipeline_status_marks_interrupted_stage_with_data(tmp_path: Path):

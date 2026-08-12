@@ -1,3 +1,5 @@
+import os
+
 from pathlib import Path
 
 from sqlmodel import select
@@ -5,8 +7,8 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import AiAnalysis, Company, CompanyAssetLink, DnsQueryStatus, DnsRecord, InternetAsset, SubdomainRecord, SubdomainToolRun
-from assetmap.services.nmap_scan import extract_ai_marked_service_ips
-from assetmap.services.subdomain import (
+from assetmap.services.mapping.nmap_scan import extract_ai_marked_service_ips
+from assetmap.services.mapping.subdomain import (
     SubdomainService,
     _tool_line_dns_values,
     _tool_line_hostname,
@@ -61,7 +63,7 @@ def test_dns_ai_analysis_uses_cache_when_payload_unchanged(tmp_path: Path):
 
 
 def test_dns_ai_analysis_batches_and_merges_targets(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("assetmap.services.subdomain.DNS_AI_BATCH_MAX_RECORDS", 1)
+    monkeypatch.setattr("assetmap.services.mapping.subdomain.DNS_AI_BATCH_MAX_RECORDS", 1)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.ai.enabled = True
     engine = create_db_and_engine(config.database.url)
@@ -137,6 +139,25 @@ def test_parse_dnsx_output_merges_subdomain_only(tmp_path: Path):
     assert session.exec(select(DnsRecord)).all() == []
 
 
+def test_subdomain_command_quotes_domain_values(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+
+    command = service._format_command(
+        "{binary} -d {domain} -o {output}",
+        "subfinder",
+        "example.cn & unexpected",
+        tmp_path / "result.txt",
+    )
+
+    if os.name != "nt":
+        assert "'example.cn & unexpected'" in command
+    else:
+        assert '"example.cn & unexpected"' in command
+
+
 def test_parse_dnsx_skips_large_output_and_removes_pollution(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.tools.subdomain_tool_max_output_lines = 2
@@ -192,19 +213,35 @@ def test_subdomain_tool_summary_logs_failures(tmp_path: Path):
     assert any("dnsx:example.cn timeout" in line for line in logs)
 
 
-def test_subdomain_tool_summary_ignores_disabled_legacy_ksubdomain(tmp_path: Path):
+def test_subdomain_tool_summary_ignores_disabled_tools(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.tools.subdomain_tools_enabled = ["subfinder", "dnsx"]
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="subfinder", command="", output_path="", status="completed"))
-    session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="ksubdomain", command="", output_path="", status="failed", error_message="timeout"))
+    session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="retired-tool", command="", output_path="", status="failed", error_message="timeout"))
     session.commit()
     logs: list[str] = []
 
     SubdomainService(session, config, progress=logs.append)._log_tool_summary(1)
 
     assert logs == ["[subdomain] tool summary: completed=1"]
+
+
+def test_subfinder_provider_hint_only_appears_when_subfinder_is_enabled(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    logs: list[str] = []
+    service = SubdomainService(session, config, progress=logs.append)
+
+    service._log_subfinder_provider_hint([("dnsx", "")])
+    assert logs == []
+
+    service._log_subfinder_provider_hint([("subfinder", "")])
+    assert len(logs) == 2
+    assert "provider API Key" in logs[0]
+    assert "SUBFINDER_PROVIDER_CONFIG" in logs[1]
 
 
 def test_interrupted_tool_run_is_detected(tmp_path: Path):
@@ -224,6 +261,34 @@ def test_interrupted_tool_run_is_detected(tmp_path: Path):
     )
 
     assert service._is_interrupted_tool_run(run) is True
+
+
+def test_failed_tool_run_is_retried_by_normal_resume(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.tools.subdomain_tools_enabled = ["subfinder"]
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    run = SubdomainToolRun(
+        scan_task_id=1,
+        root_domain="example.cn",
+        tool_name="subfinder",
+        command="old command",
+        output_path="old.txt",
+        status="failed",
+        error_message="temporary network error",
+    )
+    session.add(run)
+    session.commit()
+    session.refresh(run)
+    called: list[int] = []
+    service = SubdomainService(session, config)
+    service._run_tool_job = lambda run_id: called.append(run_id)  # type: ignore[method-assign]
+
+    service._run_enumerators(1, ["example.cn"])
+
+    assert called == [run.id]
+    assert session.get(SubdomainToolRun, run.id).status == "pending"
 
 
 def test_subdomain_audit_records_tool_and_dns_coverage(tmp_path: Path):

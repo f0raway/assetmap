@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+DEFAULT_CONFIG_TEMPLATE_PATH = Path(__file__).with_name("config.template.yaml")
 PUBLIC_CONFIG_EXCLUDE = {
     "ai": {
         "max_dns_records",
@@ -21,43 +22,46 @@ class DatabaseConfig(BaseModel):
 
 
 class OrgConfig(BaseModel):
-    control_threshold: float = 0.5
+    control_threshold: float = 0.47
     max_depth: int = 10
 
 
 class ToolCommandConfig(BaseModel):
     tools_dir: str = "tools"
     subdomain_tools_enabled: list[str] = Field(default_factory=lambda: ["subfinder", "dnsx"])
-    subdomain_tool_timeout_seconds: int = 300
-    subdomain_tool_max_output_lines: int = 10000
+    subdomain_tool_timeout_seconds: int = 5400
+    subdomain_tool_max_output_lines: int = 200000
     subfinder_command: str = "{binary} -d {domain} -silent -all -o {output}"
     dnsx_command: str = "{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc"
     wordlist: str = "data/wordlists/Subdomain.txt"
     nmap_command: str = (
-        "{binary} -Pn --top-ports 100 --open -sV --version-intensity 2 "
-        "--min-hostgroup 24 --min-rate 800 --initial-rtt-timeout 300ms "
+        "{binary} -Pn -p- --open -sV --version-intensity 5 "
+        "--min-hostgroup 16 --min-rate 500 --initial-rtt-timeout 300ms "
         "--max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit "
-        "--max-retries 2 --host-timeout 1800s {target} -oX {xml_output} -oN {normal_output}"
-    )
-    nmap_mode: str = "batch"
-    nmap_batch_command: str = (
-        "{binary} -Pn --top-ports 100 --open -sV --version-intensity 2 "
-        "--min-hostgroup 24 --min-rate 800 --initial-rtt-timeout 300ms "
-        "--max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit "
-        "--max-retries 2 --host-timeout 1800s -iL {targets_file} -oX {xml_output} -oN {normal_output}"
+        "--max-retries 2 --host-timeout 3600s -iL {targets_file} -oX {xml_output} -oN {normal_output}"
     )
     nmap_max_workers: int = 3
-    nmap_timeout_seconds: int = 600
+    nmap_timeout_seconds: int = 5400
     nmap_service_detect_command: str = "{binary} -Pn -sV --version-intensity 5 -p {ports} {target} -oX {xml_output} -oN {normal_output}"
 
-    @field_validator("tools_dir", "subfinder_command", "dnsx_command", "wordlist", "nmap_command", "nmap_mode", "nmap_batch_command", "nmap_service_detect_command")
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_nmap_batch_command(cls, value):
+        """Use the historical batch template when loading an older config file."""
+        if not isinstance(value, dict) or not value.get("nmap_batch_command"):
+            return value
+        migrated = dict(value)
+        migrated["nmap_command"] = migrated["nmap_batch_command"]
+        return migrated
+
+    @field_validator("tools_dir", "subfinder_command", "dnsx_command", "wordlist", "nmap_command", "nmap_service_detect_command")
     @classmethod
     def strip_text_fields(cls, value: str) -> str:
         return value.strip()
 
 
 class PortScanConfig(BaseModel):
-    sources_enabled: list[str] = Field(default_factory=lambda: ["nmap"])
+    sources_enabled: list[str] = Field(default_factory=lambda: ["nmap", "fofa"])
     target_sources_enabled: list[str] = Field(default_factory=lambda: ["ai", "manual", "dns_public"])
 
 
@@ -66,8 +70,8 @@ class FofaConfig(BaseModel):
     email: str = "YOUR_FOFA_EMAIL"
     api_key: str = "YOUR_FOFA_API_KEY"
     fields: str = "host,ip,port,protocol,title,server"
-    size: int = 100
-    full: bool = False
+    size: int = 1000
+    full: bool = True
     timeout_seconds: int = 30
 
     @field_validator("base_url", "email", "api_key")
@@ -84,7 +88,7 @@ class EnscanConfig(BaseModel):
     auth_token: str = "YOUR_TYC_AUTH_TOKEN"
     request_delay_seconds: float = 1.0
     request_timeout_seconds: int = 20
-    asset_workers: int = 1
+    asset_workers: int = 5
     verbose: bool = False
 
     @field_validator("script", "output_dir", "tycid", "auth_token")
@@ -95,9 +99,9 @@ class EnscanConfig(BaseModel):
 
 class WebProbeConfig(BaseModel):
     timeout_seconds: float = 8
-    max_workers: int = 20
-    max_body_bytes: int = 262144
-    max_domains_per_ip: int = 80
+    max_workers: int = 50
+    max_body_bytes: int = 1048576
+    max_domains_per_ip: int = 200
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -107,17 +111,17 @@ class WebProbeConfig(BaseModel):
 class UrlDiscoveryConfig(BaseModel):
     timeout_seconds: float = 15
     page_hard_timeout_seconds: int = 60
-    ai_timeout_seconds: int = 90
-    visual_max_pages: int = 50
+    ai_timeout_seconds: int = 240
+    visual_max_pages: int = 200
     screenshot_dir: str = "data/screenshots"
     browser_channel: str = ""  # 空字符串表示使用 Playwright 自带 Chromium
     browser_headless: bool = True
     browser_wait_until: str = "domcontentloaded"
-    browser_wait_after_load_ms: int = 1500
+    browser_wait_after_load_ms: int = 2500
     screenshot_width: int = 1365
     screenshot_height: int = 900
-    screenshot_full_page: bool = False
-    screenshot_detail: str = "low"
+    screenshot_full_page: bool = True
+    screenshot_detail: str = "high"
     allow_http_statuses: list[int] = Field(default_factory=lambda: [200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403])
 
 
@@ -125,7 +129,7 @@ class DnsConfig(BaseModel):
     timeout_seconds: float = 5
     lifetime_seconds: float = 8
     nameservers: list[str] = Field(default_factory=list)
-    max_workers: int = 20
+    max_workers: int = 50
 
     @field_validator("lifetime_seconds")
     @classmethod
@@ -139,15 +143,15 @@ class DnsConfig(BaseModel):
 
 
 class AiConfig(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     base_url: str = "https://api.openai.com/v1"
     api_key: str = "YOUR_OPENAI_API_KEY"
     api_key_header: str = "Authorization"
     model: str = "gpt-4o"
-    timeout_seconds: int = 120
-    max_dns_records: int = 2000
-    max_prompt_chars: int = 60000
-    max_completion_tokens: int = 4096
+    timeout_seconds: int = 240
+    max_dns_records: int = 5000
+    max_prompt_chars: int = 120000
+    max_completion_tokens: int = 8192
 
     @field_validator("base_url", "api_key", "api_key_header", "model")
     @classmethod
@@ -191,9 +195,5 @@ def write_sample_config(path: Path | str = DEFAULT_CONFIG_PATH, overwrite: bool 
     if file_path.exists() and not overwrite:
         return file_path
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    content = public_config_dump(AppConfig())
-    file_path.write_text(
-        yaml.safe_dump(content, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    file_path.write_text(DEFAULT_CONFIG_TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
     return file_path

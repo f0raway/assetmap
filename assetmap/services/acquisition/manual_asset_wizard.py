@@ -13,7 +13,7 @@ from questionary import Style
 from sqlmodel import Session, select
 
 from assetmap.models import Company, CompanyEdge
-from assetmap.services.manual_import import ManualAssetImportService, ManualImportResult
+from assetmap.services.acquisition.manual_import import ManualAssetImportService, ManualImportResult
 
 
 CUSTOM_STYLE = Style([

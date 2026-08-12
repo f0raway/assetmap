@@ -6,7 +6,7 @@ from assetmap.cli.pipeline import _prompt_manual_asset_import
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import Company, DnsRecord, InternetAsset, ScanTask
-from assetmap.services.manual_asset_wizard import ManualAssetWizardService
+from assetmap.services.acquisition.manual_asset_wizard import ManualAssetWizardService
 
 
 def test_add_asset_command_registered():
@@ -109,7 +109,7 @@ def test_scan_manual_add_enters_wizard(monkeypatch):
             calls.append(task_id)
             return True
 
-    monkeypatch.setattr("assetmap.services.manual_asset_wizard.ManualAssetWizardService", FakeWizard)
+    monkeypatch.setattr("assetmap.services.acquisition.manual_asset_wizard.ManualAssetWizardService", FakeWizard)
 
     changed = _prompt_manual_asset_import(
         object(),

@@ -5,7 +5,7 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsset, ScanTask
-from assetmap.services.discovery import DiscoveryService, _asset_payload
+from assetmap.services.acquisition.discovery import DiscoveryService, _asset_payload
 
 
 def test_persist_tyc_payload(tmp_path: Path):

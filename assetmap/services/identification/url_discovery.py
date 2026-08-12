@@ -4,6 +4,7 @@ import base64
 import json
 import multiprocessing as mp
 import re
+from queue import Empty
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +16,7 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
-from assetmap.services.ai_client import chat_completion, completion_finish_reason
+from assetmap.services.identification.ai_client import chat_completion, completion_finish_reason
 
 
 JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.I | re.S)
@@ -567,7 +568,10 @@ class UrlDiscoveryService:
         parsed = urlparse(value.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return None
-        port = parsed.port
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
         netloc = parsed.hostname.lower().rstrip(".")
         if port and port != _default_port(parsed.scheme):
             netloc = f"{netloc}:{port}"
@@ -868,10 +872,16 @@ class UrlDiscoveryService:
             if process.is_alive():
                 process.kill()
                 process.join(5)
+            queue.close()
+            queue.join_thread()
             raise RuntimeError(f"screenshot hard timeout after {cfg.page_hard_timeout_seconds}s")
-        if queue.empty():
-            raise RuntimeError(f"screenshot worker exited without result (exitcode={process.exitcode})")
-        result = queue.get()
+        try:
+            result = queue.get(timeout=1)
+        except Empty as exc:
+            raise RuntimeError(f"screenshot worker exited without result (exitcode={process.exitcode})") from exc
+        finally:
+            queue.close()
+            queue.join_thread()
         if not result.get("ok"):
             raise RuntimeError(result.get("error") or "screenshot failed")
         return Path(result["screenshot"]), str(result["final_url"])

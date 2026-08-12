@@ -18,7 +18,7 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsset, ScanTask, SourceRawRecord
-from assetmap.services.maintenance import MaintenanceService
+from assetmap.services.operations.maintenance import MaintenanceService
 from assetmap.utils import extract_percent, normalize_company_name, normalize_uscc, stable_hash
 
 

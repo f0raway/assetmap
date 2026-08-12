@@ -9,13 +9,13 @@ import typer
 
 from assetmap.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.services.review_workorder import ReviewWorkOrderService
-from assetmap.services.review_import import ReviewImportService
-from assetmap.services.improvement_plan import ImprovementPlanService
-from assetmap.services.gap_template import GapTemplateService
-from assetmap.services.url_discovery import UrlDiscoveryService
-from assetmap.services.report import ReportService
-from assetmap.services.package import DeliveryPackageService, DeliveryPackageVerifier
+from assetmap.services.operations.review_workorder import ReviewWorkOrderService
+from assetmap.services.operations.review_import import ReviewImportService
+from assetmap.services.operations.improvement_plan import ImprovementPlanService
+from assetmap.services.operations.gap_template import GapTemplateService
+from assetmap.services.identification.url_discovery import UrlDiscoveryService
+from assetmap.services.delivery.report import ReportService
+from assetmap.services.delivery.package import DeliveryPackageService, DeliveryPackageVerifier
 
 from .common import _bootstrap, _exit_interrupted, _csv_values
 

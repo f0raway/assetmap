@@ -9,8 +9,8 @@ from sqlmodel import Session
 
 from assetmap.config import AppConfig
 from assetmap.models import ScanTask
-from assetmap.services.exporter import ExportService
-from assetmap.services.report import ReportService
+from assetmap.services.delivery.exporter import ExportService
+from assetmap.services.delivery.report import ReportService
 
 
 @dataclass

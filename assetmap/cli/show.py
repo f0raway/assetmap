@@ -11,8 +11,8 @@ from sqlmodel import select
 from assetmap.config import DEFAULT_CONFIG_PATH, load_config
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsset, ScanTask
-from assetmap.services.status import PipelineStatusService
-from assetmap.services.quality import DeliveryQualityService
+from assetmap.services.operations.status import PipelineStatusService
+from assetmap.services.delivery.quality import DeliveryQualityService
 
 from .common import _bootstrap, _quality_suggested_actions, _print_tree
 

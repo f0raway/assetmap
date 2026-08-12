@@ -14,8 +14,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, DnsRecord, InternetAsset, ScanTask, SourceRawRecord, SubdomainRecord, WebEntrypoint
-from assetmap.services.maintenance import MaintenanceService
-from assetmap.services.subdomain import normalize_hostname
+from assetmap.services.operations.maintenance import MaintenanceService
+from assetmap.services.mapping.subdomain import normalize_hostname
 from assetmap.utils import normalize_company_name
 
 

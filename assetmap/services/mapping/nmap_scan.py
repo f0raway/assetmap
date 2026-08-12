@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
+import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,8 +17,8 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import AiAnalysis, DnsRecord, NmapPort, NmapScanRun, NmapScanTask
-from assetmap.services.fofa import FofaClient, FofaPort
-from assetmap.services.tool_resolver import ToolResolver
+from assetmap.services.mapping.fofa import FofaClient, FofaPort
+from assetmap.services.runtime.tool_resolver import ToolResolver
 
 
 NMAP_BATCH_TARGET = "__batch__"
@@ -34,8 +36,10 @@ def _utcnow() -> datetime:
 
 
 def _quote(value: str) -> str:
-    escaped = value.replace('"', '\\"')
-    return f'"{escaped}"'
+    """Quote runtime values before interpolating them into a configured shell command."""
+    if os.name == "nt":
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
 
 
 def _safe_ip(value: str) -> str:
@@ -119,39 +123,7 @@ class NmapScanService:
                 self.session.add(task)
                 self.session.commit()
                 return task.id
-            if self.config.tools.nmap_mode.lower() == "batch":
-                self._run_batch(scan_task_id, targets, rerun=rerun)
-                if "fofa" in sources:
-                    self._run_fofa(scan_task_id, targets, rerun=rerun, required=False)
-                self._validate_fofa_ports(scan_task_id, targets, rerun=rerun)
-                self._log_port_summary(scan_task_id)
-                task.status = "completed"
-                task.finished_at = _utcnow()
-                self.session.add(task)
-                self.session.commit()
-                return task.id
-            jobs: list[int] = []
-            for target in targets:
-                run = self._get_or_create_run(scan_task_id, target)
-                if run.status in {"completed", "failed"} and not rerun:
-                    self._log(f"[nmap] skip {run.status}: {target}")
-                    continue
-                if run.status == "running" and not rerun:
-                    self._log(f"[nmap] skip running: {target} (use --rerun to restart)")
-                    continue
-                if rerun and run.status in {"completed", "failed", "running"}:
-                    run.status = "pending"
-                    self.session.add(run)
-                    self.session.commit()
-                if run.id:
-                    jobs.append(run.id)
-            if jobs:
-                workers = min(max(1, self.config.tools.nmap_max_workers), len(jobs))
-                self._log(f"[nmap] running {len(jobs)} scans with {workers} workers")
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [executor.submit(self._run_one, run_id) for run_id in jobs]
-                    for future in as_completed(futures):
-                        future.result()
+            self._run_batch(scan_task_id, targets, rerun=rerun)
             if "fofa" in sources:
                 self._run_fofa(scan_task_id, targets, rerun=rerun, required=False)
             self._validate_fofa_ports(scan_task_id, targets, rerun=rerun)
@@ -206,13 +178,13 @@ class NmapScanService:
         targets_file = output_dir / "ip.txt"
         targets_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
         run = self._get_or_create_batch_run(scan_task_id, targets_file, output_dir)
-        if run.status in {"completed", "failed"} and not rerun:
-            self._log(f"[nmap] skip {run.status} batch scan: {targets_file}")
+        if run.status == "completed" and not rerun:
+            self._log(f"[nmap] skip completed batch scan: {targets_file}")
             return
         if run.status == "running" and not rerun:
             self._log("[nmap] skip running batch scan (use --rerun to restart)")
             return
-        if rerun and run.status in {"completed", "failed", "running"}:
+        if (rerun or run.status == "failed") and run.status in {"completed", "failed", "running"}:
             run.status = "pending"
             self.session.add(run)
             self.session.commit()
@@ -228,13 +200,13 @@ class NmapScanService:
         jobs: list[int] = []
         for target, ports in ports_by_ip.items():
             run = self._get_or_create_fofa_validation_run(scan_task_id, target, ports)
-            if run.status in {"completed", "failed"} and not rerun:
-                self._log(f"[nmap] skip {run.status} fofa validation: {target} ports={len(ports)}")
+            if run.status == "completed" and not rerun:
+                self._log(f"[nmap] skip completed fofa validation: {target} ports={len(ports)}")
                 continue
             if run.status == "running" and not rerun:
                 self._log(f"[nmap] skip running fofa validation: {target}")
                 continue
-            if rerun and run.status in {"completed", "failed", "running"}:
+            if (rerun or run.status == "failed") and run.status in {"completed", "failed", "running"}:
                 run.status = "pending"
                 self.session.add(run)
                 self.session.commit()
@@ -546,21 +518,8 @@ class NmapScanService:
             )
         return str(executable)
 
-    def _command(self, target: str, xml_output: Path, normal_output: Path) -> str:
+    def _scan_command(self, targets_file: Path, xml_output: Path, normal_output: Path) -> str:
         template = self.config.tools.nmap_command
-        if "{" not in template and "%s" in template:
-            values = [_quote(target), _quote(str(xml_output)), _quote(str(normal_output))]
-            return template % tuple(values[: template.count("%s")])
-        return template.format(
-            binary=_quote(self._binary_path()),
-            target=_quote(target),
-            xml_output=_quote(str(xml_output)),
-            normal_output=_quote(str(normal_output)),
-            output_dir=_quote(str(xml_output.parent)),
-        )
-
-    def _batch_command(self, targets_file: Path, xml_output: Path, normal_output: Path) -> str:
-        template = self.config.tools.nmap_batch_command
         if "{" not in template and "%s" in template:
             values = [_quote(str(targets_file)), _quote(str(xml_output)), _quote(str(normal_output))]
             return template % tuple(values[: template.count("%s")])
@@ -587,7 +546,7 @@ class NmapScanService:
     def _get_or_create_batch_run(self, scan_task_id: int, targets_file: Path, output_dir: Path) -> NmapScanRun:
         xml_output = output_dir / "nmap.xml"
         normal_output = output_dir / "nmap.txt"
-        command = self._batch_command(targets_file, xml_output, normal_output)
+        command = self._scan_command(targets_file, xml_output, normal_output)
         run = self.session.exec(
             select(NmapScanRun).where(
                 NmapScanRun.scan_task_id == scan_task_id,
@@ -606,39 +565,6 @@ class NmapScanService:
         run = NmapScanRun(
             scan_task_id=scan_task_id,
             target_ip=NMAP_BATCH_TARGET,
-            command=command,
-            xml_output_path=str(xml_output),
-            normal_output_path=str(normal_output),
-        )
-        self.session.add(run)
-        self.session.commit()
-        self.session.refresh(run)
-        return run
-
-    def _get_or_create_run(self, scan_task_id: int, target: str) -> NmapScanRun:
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        xml_output = output_dir / f"{_safe_ip(target)}.xml"
-        normal_output = output_dir / f"{_safe_ip(target)}.txt"
-        command = self._command(target, xml_output, normal_output)
-        run = self.session.exec(
-            select(NmapScanRun).where(
-                NmapScanRun.scan_task_id == scan_task_id,
-                NmapScanRun.target_ip == target,
-            )
-        ).first()
-        if run:
-            if run.command != command:
-                run.status = "pending"
-            run.command = command
-            run.xml_output_path = str(xml_output)
-            run.normal_output_path = str(normal_output)
-            self.session.add(run)
-            self.session.commit()
-            return run
-        run = NmapScanRun(
-            scan_task_id=scan_task_id,
-            target_ip=target,
             command=command,
             xml_output_path=str(xml_output),
             normal_output_path=str(normal_output),

@@ -23,7 +23,6 @@ Thumbs.db
 # Local sensitive config
 config.yaml
 config_*.yaml
-ksubdomain.yaml
 .env
 .env.*
 *.local

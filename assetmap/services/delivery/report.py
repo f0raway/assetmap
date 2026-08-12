@@ -26,9 +26,9 @@ from openpyxl.utils import get_column_letter
 from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
-from assetmap.models import AiAnalysis, ScanTask
-from assetmap.services.ai_client import chat_completion, completion_finish_reason
-from assetmap.services.exporter import ExportService
+from assetmap.models import AiAnalysis, ReportGenerationTask, ScanTask
+from assetmap.services.identification.ai_client import chat_completion, completion_finish_reason
+from assetmap.services.delivery.exporter import ExportService
 
 
 PARKING_CNAME_KEYWORDS = ("expired.", "parking", "parked", "hichina.com")
@@ -172,27 +172,58 @@ class ReportService:
         task = self.session.get(ScanTask, task_id)
         if not task:
             raise ValueError(f"Task not found: {task_id}")
-        bundle = ExportService(self.session)._bundle(task_id)
-        context = self._context(bundle)
-        root = Path(output_dir) / f"task_{task_id}_{_safe_name(task.target)}"
-        root.mkdir(parents=True, exist_ok=True)
+        generation = self._start_generation(task_id)
+        try:
+            bundle = ExportService(self.session)._bundle(task_id)
+            context = self._context(bundle)
+            root = Path(output_dir) / f"task_{task_id}_{_safe_name(task.target)}"
+            root.mkdir(parents=True, exist_ok=True)
 
-        self._log("[report] running chunked AI analysis")
-        analyses = self._run_analyses(task_id, bundle, context, rerun_ai=rerun_ai)
-        audit_path = self._write_report_ai_audit(task_id)
-        self._log(f"[report] AI analysis audit: {audit_path}")
-        context["ai_audit_rows"] = self._report_ai_audit_rows(task_id)
+            self._log("[report] running chunked AI analysis")
+            analyses = self._run_analyses(task_id, bundle, context, rerun_ai=rerun_ai)
+            audit_path = self._write_report_ai_audit(task_id)
+            self._log(f"[report] AI analysis audit: {audit_path}")
+            context["ai_audit_rows"] = self._report_ai_audit_rows(task_id)
 
-        self._log("[report] preparing Excel attachments")
-        asset_workbook = root / f"task_{task_id}_资产汇总.xlsx"
-        web_workbook = root / f"task_{task_id}_Web资产详情.xlsx"
-        asset_workbook = self._write_asset_workbook(asset_workbook, context)
-        web_workbook = self._write_web_workbook(web_workbook, context)
+            self._log("[report] preparing Excel attachments")
+            asset_workbook = root / f"task_{task_id}_资产汇总.xlsx"
+            web_workbook = root / f"task_{task_id}_Web资产详情.xlsx"
+            asset_workbook = self._write_asset_workbook(asset_workbook, context)
+            web_workbook = self._write_web_workbook(web_workbook, context)
 
-        self._log("[report] writing Word report")
-        report_path = root / f"task_{task_id}_互联网资产暴露面测绘报告.docx"
-        report_path = self._write_docx(report_path, task, context, analyses, asset_workbook, web_workbook)
-        return ReportResult(report_path, asset_workbook, web_workbook, len(analyses))
+            self._log("[report] writing Word report")
+            report_path = root / f"task_{task_id}_互联网资产暴露面测绘报告.docx"
+            report_path = self._write_docx(report_path, task, context, analyses, asset_workbook, web_workbook)
+            generation.status = "completed"
+            generation.finished_at = _utcnow()
+            generation.error_message = None
+            generation.report_path = str(report_path)
+            generation.asset_workbook_path = str(asset_workbook)
+            generation.web_workbook_path = str(web_workbook)
+            self.session.add(generation)
+            self.session.commit()
+            return ReportResult(report_path, asset_workbook, web_workbook, len(analyses))
+        except Exception as exc:
+            generation.status = "failed"
+            generation.finished_at = _utcnow()
+            generation.error_message = str(exc)[:1000]
+            self.session.add(generation)
+            self.session.commit()
+            raise
+
+    def _start_generation(self, task_id: int) -> ReportGenerationTask:
+        row = self.session.exec(
+            select(ReportGenerationTask).where(ReportGenerationTask.scan_task_id == task_id)
+        ).first()
+        if not row:
+            row = ReportGenerationTask(scan_task_id=task_id)
+        row.status = "running"
+        row.started_at = _utcnow()
+        row.finished_at = None
+        row.error_message = None
+        self.session.add(row)
+        self.session.commit()
+        return row
 
     def _context(self, bundle: dict) -> dict:
         companies = {row["id"]: row for row in bundle["companies"]}

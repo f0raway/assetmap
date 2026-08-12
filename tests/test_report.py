@@ -4,6 +4,7 @@ from pathlib import Path
 
 from docx import Document
 from openpyxl import load_workbook
+import pytest
 from sqlmodel import select
 
 from assetmap.config import AiConfig, AppConfig, DatabaseConfig
@@ -17,24 +18,26 @@ from assetmap.models import (
     InternetAsset,
     NmapPort,
     NmapScanTask,
+    ReportGenerationTask,
     ScanTask,
     ServiceAsset,
     SourceRawRecord,
     WebEntrypoint,
 )
-from assetmap.services.gap_template import GapTemplateService
-from assetmap.services.improvement_plan import ImprovementPlanService
-from assetmap.services.exporter import ExportService
-from assetmap.services.package import DeliveryPackageService, DeliveryPackageVerifier
-from assetmap.services.quality import DeliveryQualityService
-from assetmap.services.report import ReportService
-from assetmap.services.review_import import ReviewImportService
-from assetmap.services.review_workorder import ReviewWorkOrderService
+from assetmap.services.operations.gap_template import GapTemplateService
+from assetmap.services.operations.improvement_plan import ImprovementPlanService
+from assetmap.services.delivery.exporter import ExportService
+from assetmap.services.delivery.package import DeliveryPackageService, DeliveryPackageVerifier
+from assetmap.services.delivery.quality import DeliveryQualityService
+from assetmap.services.delivery.report import ReportService
+from assetmap.services.operations.review_import import ReviewImportService
+from assetmap.services.operations.review_workorder import ReviewWorkOrderService
 
 
 def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.ai.enabled = False
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     task = ScanTask(id=1, target="示例集团有限公司", status="completed")
@@ -116,6 +119,9 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     assert result.report_path.exists()
     assert result.asset_workbook_path.exists()
     assert result.web_workbook_path.exists()
+    generation = session.exec(select(ReportGenerationTask).where(ReportGenerationTask.scan_task_id == 1)).one()
+    assert generation.status == "completed"
+    assert generation.report_path == str(result.report_path)
     ai_audit = __import__("json").loads(Path("data/report/task_1/report_ai_audit.json").read_text(encoding="utf-8"))
     assert ai_audit["section_count"] == 4
     assert ai_audit["status_counts"] == {"skipped": 4}
@@ -142,6 +148,7 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     assert "互联网数字资产暴露面测绘报告" in "\n".join(p.text for p in doc.paragraphs)
     assert "示例集团有限公司" in doc.sections[0].header.paragraphs[0].text
     assert "assetmap 自动生成" in doc.sections[0].footer.paragraphs[0].text
+
     assert len(doc.tables) >= 10
     asset_wb = load_workbook(result.asset_workbook_path)
     asset_wb_sheets = asset_wb.sheetnames
@@ -341,6 +348,61 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     assert any("补全计划" in item for item in broken.failures)
 
 
+def test_report_generation_marks_artifact_write_failure(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.ai.enabled = False
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(ScanTask(id=1, target="示例集团有限公司", status="completed"))
+    session.commit()
+    service = ReportService(session, config)
+    service._write_asset_workbook = lambda path, context: (_ for _ in ()).throw(OSError("disk full"))  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="disk full"):
+        service.run(1, output_dir=tmp_path / "reports")
+
+    generation = session.exec(select(ReportGenerationTask).where(ReportGenerationTask.scan_task_id == 1)).one()
+    assert generation.status == "failed"
+    assert generation.error_message == "disk full"
+
+
+def test_package_build_failure_keeps_previous_delivery(tmp_path: Path, monkeypatch):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    task = ScanTask(id=1, target="示例集团有限公司", status="completed")
+    session.add(task)
+    session.commit()
+    output_dir = tmp_path / "deliveries"
+    package_dir = output_dir / "task_1_示例集团有限公司"
+    package_dir.mkdir(parents=True)
+    (package_dir / "previous.txt").write_text("keep", encoding="utf-8")
+    zip_path = package_dir.with_suffix(".zip")
+    zip_path.write_bytes(b"previous zip")
+
+    class FakeQuality:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def check(self, *args, **kwargs):
+            return type("Quality", (), {"failures": [], "warnings": [], "lines": ["ok"], "status": "PASS"})()
+
+        def _report_paths(self, *args, **kwargs):
+            return {"Word报告": tmp_path / "source.docx"}
+
+    monkeypatch.setattr("assetmap.services.delivery.package.DeliveryQualityService", FakeQuality)
+    service = DeliveryPackageService(session, config)
+    service._copy = lambda source, destination: (_ for _ in ()).throw(OSError("copy failed"))  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="copy failed"):
+        service.package(1, reports_dir=tmp_path / "reports", output_dir=output_dir)
+
+    assert (package_dir / "previous.txt").read_text(encoding="utf-8") == "keep"
+    assert zip_path.read_bytes() == b"previous zip"
+    assert not list(output_dir.glob(".task_1_示例集团有限公司.building-*"))
+
+
 def test_workbook_sanitizes_tool_control_characters(tmp_path: Path):
     service = ReportService(None, AppConfig())  # type: ignore[arg-type]
     workbook_path = tmp_path / "report.xlsx"
@@ -350,14 +412,14 @@ def test_workbook_sanitizes_tool_control_characters(tmp_path: Path):
         {
             "交付审计文件": [
                 {
-                    "工具失败": "ksubdomain=\x1b[[1;31mFatal\x1b[0m] 获取网络设备超时\x00\x08",
+                    "工具失败": "dnsx=\x1b[[1;31mFatal\x1b[0m] DNS 查询超时\x00\x08",
                 }
             ]
         },
     )
 
     sheet = load_workbook(result)["交付审计文件"]
-    assert sheet["A2"].value == "ksubdomain=Fatal 获取网络设备超时"
+    assert sheet["A2"].value == "dnsx=Fatal DNS 查询超时"
 
 
 def test_quality_uses_latest_fallback_report_artifacts(tmp_path: Path):
@@ -474,7 +536,7 @@ def test_report_ai_analysis_cache_refreshes_when_payload_changes(tmp_path: Path,
         calls.append((args, kwargs))
         return {"choices": [{"message": {"content": "新结论"}}]}
 
-    monkeypatch.setattr("assetmap.services.report.chat_completion", fake_chat_completion)
+    monkeypatch.setattr("assetmap.services.delivery.report.chat_completion", fake_chat_completion)
 
     refreshed = service._analysis(1, "report_ports", "端口与服务暴露分析", {"stats": {"资产数量": 2}}, rerun_ai=False)
     cached = service._analysis(1, "report_ports", "端口与服务暴露分析", {"stats": {"资产数量": 2}}, rerun_ai=False)
@@ -503,7 +565,7 @@ def test_report_ai_analysis_retries_when_output_truncated(tmp_path: Path, monkey
             return {"choices": [{"finish_reason": "length", "message": {"content": "未完成"}}]}
         return {"choices": [{"finish_reason": "stop", "message": {"content": "完整结论"}}]}
 
-    monkeypatch.setattr("assetmap.services.report.chat_completion", fake_chat_completion)
+    monkeypatch.setattr("assetmap.services.delivery.report.chat_completion", fake_chat_completion)
 
     summary = service._analysis(1, "report_ports", "端口与服务暴露分析", {"stats": {"资产数量": 2}}, rerun_ai=False)
     row = session.exec(select(AiAnalysis).where(AiAnalysis.analysis_type == "report_ports")).one()
@@ -1077,7 +1139,7 @@ def test_dns_quality_rows_flag_tool_failures_and_third_party_cname(tmp_path: Pat
                 {"fqdn": "www.example.cn", "root_domain": "example.cn", "record_type": "CNAME", "value": "expired.hichina.com"},
             ],
             "subdomain_tool_runs": [
-                {"root_domain": "example.cn", "tool_name": "ksubdomain", "status": "failed", "error_message": "timeout"}
+                {"root_domain": "example.cn", "tool_name": "dnsx", "status": "failed", "error_message": "timeout"}
             ],
         },
         {"example.cn": "示例集团有限公司"},

@@ -8,9 +8,9 @@ import typer
 
 from assetmap.config import DEFAULT_CONFIG_PATH, load_config
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.services.report import ReportService
-from assetmap.services.quality import DeliveryQualityService
-from assetmap.services.package import DeliveryPackageService, DeliveryPackageVerifier
+from assetmap.services.delivery.report import ReportService
+from assetmap.services.delivery.quality import DeliveryQualityService
+from assetmap.services.delivery.package import DeliveryPackageService, DeliveryPackageVerifier
 
 from .common import _exit_interrupted
 

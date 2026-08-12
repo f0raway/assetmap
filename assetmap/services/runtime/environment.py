@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from assetmap.config import AppConfig
-from assetmap.services.tool_resolver import ToolResolver
+from assetmap.services.runtime.tool_resolver import ToolResolver
 
 
 PYTHON_IMPORTS = {

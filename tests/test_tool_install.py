@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from assetmap.services.tool_install import TOOL_DOWNLOADS, ToolInstallService
+from assetmap.services.runtime.tool_install import TOOL_DOWNLOADS, ToolInstallService
 
 
 def test_install_tools_empty_list_defaults_to_all(monkeypatch):

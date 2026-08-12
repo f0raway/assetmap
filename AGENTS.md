@@ -1,6 +1,6 @@
 # AGENTS.md — assetmap
 
-Chinese-language cybersecurity asset-mapping CLI. Python 3.9+, Typer CLI, SQLModel/SQLite, Pydantic v2 config, httpx, openpyxl, python-docx. Orchestrate external tools (subfinder, ksubdomain, nmap), FOFA API, Playwright screenshots, and an OpenAI-compatible AI gateway into a resumable pipeline that produces Word/Excel deliverables.
+Chinese-language cybersecurity asset-mapping CLI. Python 3.9+, Typer CLI, SQLModel/SQLite, Pydantic v2 config, httpx, openpyxl, python-docx. Orchestrate external tools (subfinder, dnsx, nmap), FOFA API, Playwright screenshots, and an OpenAI-compatible AI gateway into a resumable pipeline that produces Word/Excel deliverables.
 
 ## Setup
 
@@ -54,7 +54,7 @@ assetmap asset-gap-template <task_id> --priority high-medium --include-partial -
 
 # 新增命令
 assetmap configure                                # TUI 配置向导：交互式配置 API 密钥
-assetmap install-tools                            # 安装外部工具：subfinder, ksubdomain, nmap
+assetmap install-tools                            # 安装外部工具：subfinder, dnsx, nmap
 assetmap install-tools subfinder                  # 只安装特定工具
 assetmap env-check                                # 检查环境依赖（改进后的友好输出）
 ```
@@ -63,7 +63,7 @@ assetmap env-check                                # 检查环境依赖（改进�
 
 1. `discover` — Corporate equity, ICP filings, domains, apps, mini-programs, WeChat accounts, emails
 2. Manual asset import
-3. `subdomains` — subfinder (passive) + ksubdomain (active brute-force) + DNS resolution → AI judges real server IPs
+3. `subdomains` — subfinder (passive) + dnsx (active wordlist discovery and DNS resolution) → AI judges real server IPs
 4. `port-scan` — nmap (active) + FOFA (passive), merged/deduped
 5. `classify` — Service identification → Web URL entry generation
 6. `url-discover` — Playwright screenshots → multimodal AI recognition
@@ -89,22 +89,20 @@ assetmap/
 ├── utils.py
 ├── collectors/
 │   └── tyc_invest_crawler.py   # ENScan/TYC corporate data collector (configurable via enscan.script)
-└── services/               # One service per pipeline stage
-    ├── discovery.py, subdomain.py, nmap_scan.py, fofa.py,
-    ├── asset_classifier.py, url_discovery.py, report.py,
-    ├── quality.py, package.py, review_workorder.py, review_import.py,
-    ├── improvement_plan.py, gap_template.py, maintenance.py,
-    ├── ai_client.py, environment.py, exporter.py,
-    ├── manual_import.py, manual_asset_wizard.py, status.py, tool_resolver.py,
-    ├── config_wizard.py, tool_install.py
+└── services/               # Grouped by business capability
+    ├── acquisition/        # enterprise discovery and manual asset import
+    ├── mapping/            # subdomains, DNS, FOFA and port discovery
+    ├── identification/     # service, Web and AI identification
+    ├── delivery/           # export, report, quality and package
+    ├── operations/         # status, review, improvement and maintenance
+    └── runtime/            # config wizard, environment and external tools
 ```
 
 ## Key Conventions
 
 - **Breakpoint resume is default.** Same company name → reuses last task. Use `--refresh` to restart. `run` without `--rerun-*` only processes incomplete/stale stages.
-- **External tools** live in `tools/{subfinder,ksubdomain,nmap}/`. `tool_resolver.py` finds binaries. Commands are templated in `config.yaml` with `{binary}`, `{domain}`, `{output}`, `{target}`, `{wordlist}`, `{xml_output}`, `{normal_output}`, `{targets_file}`, `{ports}` placeholders.
-- **ksubdomain** needs `ksubdomain.yaml` (gitignored) with `src_ip`, `device`, MAC addresses. See `ksubdomain.example.yaml`.
-- **AI client** (`ai_client.py`) is OpenAI-compatible. Config: `ai.base_url`, `ai.api_key`, `ai.api_key_header` (default `api-key`), `ai.model`. Used for DNS IP judgment, visual screenshot analysis, and report generation.
+- **External tools** live in `tools/{subfinder,dnsx,nmap}/`. `runtime/tool_resolver.py` finds binaries. Commands are templated in `config.yaml` with `{binary}`, `{domain}`, `{output}`, `{target}`, `{wordlist}`, `{xml_output}`, `{normal_output}`, `{targets_file}`, `{ports}` placeholders.
+- **AI client** (`identification/ai_client.py`) is OpenAI-compatible. Config: `ai.base_url`, `ai.api_key`, `ai.api_key_header` (default `api-key`), `ai.model`. Used for DNS IP judgment, visual screenshot analysis, and report generation.
 - **Data directory** (`data/`) is mostly gitignored. Tracked: `data/wordlists/`, `data/manual_assets.example.yaml`. Generated: `data/assetmap.db`, `data/enscan/`, `data/subdomains/`, `data/nmap/`, `data/classify/`, `data/screenshots/`, `data/report/`.
 - **Report output** goes to `reports/task_<task_id>_<target>/`. Delivery zips go to `deliveries/`.
 - **Quality gate**: PASS = deliverable; WARN = deliverable with gaps (review workorder + improvement plan attached); FAIL = must fix before delivery. `--strict` turns WARN into a hard stop.
@@ -122,10 +120,10 @@ No special fixtures or services required for unit tests. Integration tests that 
 
 ## Things an Agent Might Get Wrong
 
-- Do NOT commit `config.yaml`, `ksubdomain.yaml`, `data/assetmap.db`, `deliveries/`, `exports/`, or `data/` results.
+- Do NOT commit `config.yaml`, `data/assetmap.db`, `deliveries/`, `exports/`, or `data/` results.
 - Do NOT assume `config.yaml` exists — run `assetmap init` first.
 - Do NOT run `pip install -e .` without extras if visual features are needed — use `.[dev,visual]`.
 - Do NOT invent pipeline stage names — they are exactly: `subdomains`, `port-scan`, `classify`, `url-discover`, `report` (see `PIPELINE_STAGES` in `cli/common.py`).
 - Do NOT skip `--rerun-*` flags when you want to redo a stage — `run` alone is incremental.
 - Do NOT treat WARN from quality-check as a failure — it's expected for partial coverage.
-- Wordlist path is configured at `tools.wordlist` (default `data/wordlists/1.txt`).
+- Wordlist path is configured at `tools.wordlist` (default `data/wordlists/Subdomain.txt`).

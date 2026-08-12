@@ -10,9 +10,9 @@ from sqlmodel import Session
 
 from assetmap.config import AppConfig
 from assetmap.models import ScanTask
-from assetmap.services.exporter import ExportService
-from assetmap.services.report import ReportService, _safe_name
-from assetmap.services.status import PipelineStatusService
+from assetmap.services.delivery.exporter import ExportService
+from assetmap.services.delivery.report import ReportService, _safe_name
+from assetmap.services.operations.status import PipelineStatusService
 
 
 EXPECTED_ASSET_SHEETS = {
@@ -60,9 +60,10 @@ class DeliveryQualityService:
         warnings: list[str] = []
 
         pipeline = PipelineStatusService(self.session).get(task_id)
-        incomplete = [name for name, status, _ in pipeline.stages if status != "completed"]
+        incomplete, pipeline_warnings = self._pipeline_issues(pipeline.stages)
         if incomplete:
             failures.append(f"流程未完成: {', '.join(incomplete)}")
+        warnings.extend(pipeline_warnings)
 
         bundle = ExportService(self.session)._bundle(task_id)
         context = ReportService(self.session, self.config)._context(bundle)
@@ -99,6 +100,19 @@ class DeliveryQualityService:
             warnings,
         )
         return QualityResult(status=status, failures=failures, warnings=warnings, lines=lines)
+
+    def _pipeline_issues(self, stages: list[tuple[str, str, str]]) -> tuple[list[str], list[str]]:
+        """Separate resumable partial coverage from hard delivery blockers."""
+        incomplete: list[str] = []
+        warnings: list[str] = []
+        for name, status, detail in stages:
+            if status == "completed":
+                continue
+            if status == "completed_with_errors" and name in {"subdomains", "port-scan"}:
+                warnings.append(f"{name}阶段存在失败子任务，交付数据可能不完整: {detail}")
+                continue
+            incomplete.append(name)
+        return incomplete, warnings
 
     def _report_paths(self, task: ScanTask, output_dir: Path | str) -> dict[str, Path]:
         root = Path(output_dir) / f"task_{task.id}_{_safe_name(task.target)}"

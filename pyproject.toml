@@ -39,3 +39,6 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 include = ["assetmap*"]
+
+[tool.setuptools.package-data]
+assetmap = ["config.template.yaml"]

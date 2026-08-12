@@ -6,7 +6,7 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import DnsRecord, NmapPort, ServiceAsset, WebProbeResult
-from assetmap.services.asset_classifier import AssetClassifierService
+from assetmap.services.identification.asset_classifier import AssetClassifierService
 
 
 def test_web_asset_prefers_final_url(tmp_path: Path):
@@ -174,6 +174,60 @@ def test_obvious_non_web_ports_are_not_web_probed(tmp_path: Path):
     assert captured == []
 
 
+def test_service_detection_reuses_deep_nmap_evidence_and_checks_fofa_only_port(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    nmap_port = NmapPort(
+        scan_task_id=1,
+        target_ip="8.8.8.8",
+        protocol="tcp",
+        port=443,
+        state="open",
+        service="https",
+        raw_payload={"source": "nmap", "service": {"name": "https"}},
+    )
+    fofa_port = NmapPort(
+        scan_task_id=1,
+        target_ip="8.8.4.4",
+        protocol="tcp",
+        port=8443,
+        state="open",
+        raw_payload={"source": "fofa"},
+    )
+    detected: list[tuple[str, list[int]]] = []
+    service._detect_host_services = (  # type: ignore[method-assign]
+        lambda scan_task_id, target_ip, ports: detected.append((target_ip, [port.port for port in ports]))
+    )
+
+    service._detect_services(1, [nmap_port, fofa_port])
+
+    assert detected == [("8.8.4.4", [8443])]
+
+
+def test_service_detection_falls_back_when_custom_nmap_command_has_no_version_detect(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.tools.nmap_command = "{binary} -Pn -p- -iL {targets_file} -oX {xml_output} -oN {normal_output}"
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    port = NmapPort(
+        scan_task_id=1,
+        target_ip="8.8.8.8",
+        protocol="tcp",
+        port=443,
+        state="open",
+        raw_payload={"source": "nmap"},
+    )
+    detected: list[int] = []
+    service._detect_host_services = lambda scan_task_id, target_ip, ports: detected.extend(port.port for port in ports)  # type: ignore[method-assign]
+
+    service._detect_services(1, [port])
+
+    assert detected == [443]
+
+
 def test_nonstandard_port_uses_fofa_host_without_dns_fanout(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
@@ -248,3 +302,21 @@ def test_failed_active_probe_keeps_fofa_passive_web_asset(tmp_path: Path):
     assert row.representative_url == "http://8.8.8.8:9980/"
     assert row.title == "工单系统"
     assert row.evidence["passive_web_source"] == "fofa"
+
+
+def test_invalid_fofa_host_port_falls_back_to_verified_port(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    port = NmapPort(
+        scan_task_id=1,
+        target_ip="8.8.8.8",
+        protocol="tcp",
+        port=8443,
+        state="open",
+    )
+
+    url = service._passive_web_url("https://portal.example.cn:not-a-port", "https", port.port)
+
+    assert url == "https://portal.example.cn:8443/"

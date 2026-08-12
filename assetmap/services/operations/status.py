@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlmodel import Session, select
 
@@ -11,14 +12,18 @@ from assetmap.models import (
     Company,
     CompanyAssetLink,
     CompanyEdge,
+    DnsQueryStatus,
     DnsRecord,
     InternetAsset,
     NmapPort,
+    NmapScanRun,
     NmapScanTask,
+    ReportGenerationTask,
     ScanTask,
     ServiceAsset,
     SubdomainEnumerationTask,
     SubdomainRecord,
+    SubdomainToolRun,
     UrlDiscoveryTask,
     WebEntrypoint,
 )
@@ -127,13 +132,47 @@ class PipelineStatusService:
         url_task = self.session.exec(
             select(UrlDiscoveryTask).where(UrlDiscoveryTask.scan_task_id == task_id)
         ).first()
+        report_task = self.session.exec(
+            select(ReportGenerationTask).where(ReportGenerationTask.scan_task_id == task_id)
+        ).first()
+        subdomain_failed_runs = self.session.exec(
+            select(SubdomainToolRun).where(
+                SubdomainToolRun.scan_task_id == task_id,
+                SubdomainToolRun.status == "failed",
+            )
+        ).all()
+        failed_dns_queries = self.session.exec(
+            select(DnsQueryStatus).where(
+                DnsQueryStatus.scan_task_id == task_id,
+                DnsQueryStatus.status == "failed",
+            )
+        ).all()
+        failed_nmap_runs = self.session.exec(
+            select(NmapScanRun).where(
+                NmapScanRun.scan_task_id == task_id,
+                NmapScanRun.status == "failed",
+            )
+        ).all()
+        subdomain_status = self._status_with_partial_failures(
+            self._task_status(subdomain_task, counts["subdomains"] or counts["dns"]),
+            len(subdomain_failed_runs) + len(failed_dns_queries),
+        )
+        nmap_status = self._status_with_partial_failures(
+            self._task_status(nmap_task, counts["open_ports"]),
+            len(failed_nmap_runs),
+        )
+        report_status, report_artifacts = self._report_status(report_task, counts["report_sections"])
         return [
             ("discover", self._done_if(counts["companies"] or counts["assets"]), f"companies={counts['companies']}, assets={counts['assets']}"),
-            ("subdomains", self._task_status(subdomain_task, counts["subdomains"] or counts["dns"]), f"subdomains={counts['subdomains']}, dns_records={counts['dns']}"),
-            ("port-scan", self._task_status(nmap_task, counts["open_ports"]), f"open_ports={counts['open_ports']}"),
+            (
+                "subdomains",
+                subdomain_status,
+                f"subdomains={counts['subdomains']}, dns_records={counts['dns']}, failed_items={len(subdomain_failed_runs) + len(failed_dns_queries)}",
+            ),
+            ("port-scan", nmap_status, f"open_ports={counts['open_ports']}, failed_runs={len(failed_nmap_runs)}"),
             ("classify", self._task_status(classify_task, counts["service_assets"]), f"services={counts['service_assets']}, web={counts['web_assets']}"),
             ("url-discover", self._task_status(url_task, counts["web_entrypoints"]), f"entrypoints={counts['web_entrypoints']}, visual_ok={counts['visual_done']}, visual_error={counts['visual_failed']}"),
-            ("report", self._done_if(counts["report_sections"] >= 4), f"ai_sections={counts['report_sections']}"),
+            ("report", report_status, f"ai_sections={counts['report_sections']}, artifacts={report_artifacts}"),
         ]
 
     def _task_status(self, task, has_data: int) -> str:
@@ -144,6 +183,36 @@ class PipelineStatusService:
                 return f"{task.status}_with_data"
             return task.status
         return self._done_if(has_data)
+
+    def _status_with_partial_failures(self, status: str, failed_count: int) -> str:
+        if status == "completed" and failed_count:
+            return "completed_with_errors"
+        return status
+
+    def _report_status(self, task: ReportGenerationTask | None, section_count: int) -> tuple[str, str]:
+        paths = [
+            Path(value)
+            for value in (
+                getattr(task, "report_path", None),
+                getattr(task, "asset_workbook_path", None),
+                getattr(task, "web_workbook_path", None),
+            )
+            if value
+        ]
+        artifacts_ready = len(paths) == 3 and all(path.exists() and path.stat().st_size > 0 for path in paths)
+        artifact_state = "ok" if artifacts_ready else "missing"
+        if task:
+            if task.status in {"failed", "interrupted"}:
+                return task.status, artifact_state
+            status = self._task_status(task, section_count)
+            if status == "completed" and not artifacts_ready:
+                return "completed_with_errors", artifact_state
+            return status, artifact_state
+        # Existing tasks from before report-generation tracking are complete
+        # only when all AI chunks and the generated deliverables are present.
+        if section_count >= 4 and artifacts_ready:
+            return "completed", artifact_state
+        return "pending", artifact_state
 
     def _is_stale_running(self, task) -> bool:
         started_at = getattr(task, "started_at", None)

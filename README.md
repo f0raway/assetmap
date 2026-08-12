@@ -62,6 +62,7 @@ assetmap ai-check
 
 ```powershell
 pip install -e .[visual]
+playwright install chromium
 ```
 
 完整开发环境可以一次安装：
@@ -84,7 +85,7 @@ python -m pip install -e ".[visual]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 - `data/manual_assets.example.yaml`：手工资产补充模板。
 - `data/assetmap.db`：SQLite 数据库。
 
-公开仓库默认不提交本地 `config.yaml`、`ksubdomain.yaml`、`deliveries/`、`exports/` 和运行生成的 `data/` 结果文件。
+公开仓库默认不提交本地 `config.yaml`、`deliveries/`、`exports/` 和运行生成的 `data/` 结果文件。
 从 GitHub 克隆后，先执行 `assetmap init`，或复制 `config.example.yaml` 为 `config.yaml` 后再填写你自己的密钥与本机网络参数。
 
 `init` 默认不会覆盖已有 `config.yaml`。需要重新生成模板时才执行：
@@ -93,7 +94,32 @@ python -m pip install -e ".[visual]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 assetmap init --force
 ```
 
+可用以下命令检查和准备本机环境：
+
+```powershell
+assetmap configure       # 交互式填写本地配置与 API 凭证
+assetmap install-tools   # 安装 subfinder、dnsx、nmap
+assetmap env-check       # 检查密钥、字典、工具与浏览器
+assetmap ai-check        # 验证 AI 网关连通性
+```
+
 ## 配置重点
+
+项目默认生成深度测绘配置：启用 Nmap 与 FOFA 双来源、全端口服务识别、完整子域名字典、AI 分析和全页高精度截图。请只对已获授权的目标执行；首次运行前必须在 `config.yaml` 填写天眼查、FOFA 和 AI 凭证。
+
+`assetmap scan` 会在开始任何外部采集前执行环境预检查；缺少凭证、扫描工具、字典或浏览器时会直接列出缺项并停止，避免产生不完整任务或无效外部请求。
+
+### Subfinder Provider Key
+
+`subfinder` 是默认的被动子域名发现工具，但它的覆盖率依赖各数据源的个人 API Key。没有 Key 也能运行，只是结果会明显变少；Key 不应写入 `config.yaml`、报告、命令行历史或 Git 仓库。
+
+推荐使用 Subfinder 的独立 Provider 配置文件：
+
+```text
+macOS / Linux: ~/.config/subfinder/provider-config.yaml
+```
+
+也可通过 `-pc <文件路径>` 或环境变量 `SUBFINDER_PROVIDER_CONFIG` 指定该文件。建议优先按自身已开通的账号配置 Chaos、Censys、FOFA、GitHub、SecurityTrails、Shodan、ZoomEye、VirusTotal 等 Provider。运行子域名阶段时，程序也会给出这一提示；请只填入你自己拥有且有权使用的密钥。
 
 企业和备案资产采集使用项目内置脚本：
 
@@ -104,7 +130,7 @@ enscan:
   auth_token: YOUR_TYC_AUTH_TOKEN
   request_delay_seconds: 1.0
   request_timeout_seconds: 20
-  asset_workers: 1
+  asset_workers: 5
 ```
 
 端口发现可以主动、被动或两者同时开启：
@@ -129,11 +155,11 @@ Web 截图与视觉识别：
 url_discovery:
   timeout_seconds: 15
   page_hard_timeout_seconds: 60
-  visual_max_pages: 50
-  browser_channel: chrome
+  visual_max_pages: 200
+  browser_channel: ""
   browser_headless: true
   browser_wait_until: domcontentloaded
-  browser_wait_after_load_ms: 1500
+  browser_wait_after_load_ms: 2500
   screenshot_width: 1365
   screenshot_height: 900
 ```
@@ -150,6 +176,8 @@ ai:
 ```
 
 ## 流水线说明
+
+代码目录与模块依赖说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。服务层按资产采集、网络测绘、识别、交付、运营和运行环境六类职责组织。
 
 完整流程如下：
 
@@ -248,10 +276,12 @@ assetmap run <task_id> --from-stage subdomains
 系统会：
 
 - 用 `subfinder` 做被动子域名枚举。
-- 用 `ksubdomain` 和 `tools.wordlist` 做主动爆破。
+- 用 `dnsx` 和 `tools.wordlist` 做主动子域名发现与 DNS 解析。
 - 解析 A/AAAA/CNAME/MX/TXT 等记录。
 - 让 AI 从 DNS 记录中判断更可能是真实业务服务器的公网 IP。
 - 生成 `data/subdomains/task_<task_id>/subdomain_audit.json`。
+
+默认深度配置使用约 73 万条字典，并为主动发现预留 90 分钟。工具任务、DNS 查询如果因网络或临时错误失败，会在下一次普通 `assetmap run <task_id>` 时自动补试；不需要先删除数据库记录。
 
 如果 DNS 污染或解析器异常，可配置 `dns.nameservers` 后重跑：
 
@@ -279,6 +309,8 @@ assetmap run <task_id> --from-stage port-scan
 - `fofa`：被动搜索。
 
 系统会合并去重主动和被动证据。FOFA-only 端口会作为线索保留；如果同时启用 Nmap，会对 FOFA 端口做精确主动验证。
+
+主 Nmap 命令已经包含高强度服务识别，因此分类阶段会复用已有结果，避免重复扫描；只有 FOFA 独有端口或自定义主扫描未启用服务识别时才会补充验证。失败的 Nmap/FOFA 验证任务同样会在普通续跑时自动重试。
 
 审计文件：
 
@@ -381,6 +413,8 @@ assetmap report <task_id>
 
 审计文件会记录每个 AI 分块的状态、模型、输入指纹、输入规模、响应 ID、响应模型和 token 用量，便于追溯报告结论。
 
+报告生成会单独记录 Word 与 Excel 的写入状态。若 AI 分块已经完成但文件写入失败，下一次 `assetmap run <task_id> --from-stage report` 会复用有效 AI 结果并重新生成附件，不会把旧的 AI 缓存误判为完整报告。
+
 ### 8. 质量门禁、补全计划和交付
 
 质量检查：
@@ -426,6 +460,8 @@ assetmap deliver <task_id>
 - 截图证据清单。
 - `manifest.json`。
 - `交付说明.txt`。
+
+打包会先在临时目录完整构建并生成 ZIP，全部成功后才替换正式交付包；中途失败时，已有的交付目录和 ZIP 会被保留。
 
 校验交付包：
 
@@ -483,6 +519,7 @@ assetmap export <task_id> --format json
 
 - `discover "公司名称"` 和 `scan "公司名称"` 默认复用同名目标最近一次任务。
 - `run <task_id>` 默认只跑未完成或受新增数据影响的后续环节。
+- 已完成但仍存在子域名/DNS、Nmap 或 FOFA 子任务失败时，状态会显示为 `completed_with_errors`；普通 `run` 会自动重试这些项。
 - `url-discover` 默认不会反复重跑已成功识别的页面。
 - `--retry-failed` 只补跑失败或 HTTP 降级页面。
 - `--rerun-*` 才表示主动刷新某个环节。

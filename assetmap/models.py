@@ -318,6 +318,23 @@ class UrlDiscoveryTask(SQLModel, table=True):
     stage: str = Field(default="pending", index=True)
 
 
+class ReportGenerationTask(SQLModel, table=True):
+    """Tracks report file generation separately from cached AI sections."""
+
+    __tablename__ = "report_generation_tasks"
+    __table_args__ = (UniqueConstraint("scan_task_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_task_id: int = Field(index=True, foreign_key="scan_tasks.id")
+    status: str = Field(default="pending", index=True)
+    started_at: datetime = Field(default_factory=utcnow, nullable=False)
+    finished_at: Optional[datetime] = Field(default=None)
+    error_message: Optional[str] = Field(default=None)
+    report_path: Optional[str] = Field(default=None)
+    asset_workbook_path: Optional[str] = Field(default=None)
+    web_workbook_path: Optional[str] = Field(default=None)
+
+
 class WebEntrypoint(SQLModel, table=True):
     __tablename__ = "web_entrypoints"
     __table_args__ = (UniqueConstraint("scan_task_id", "normalized_url"),)

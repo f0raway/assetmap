@@ -1,15 +1,38 @@
 from pathlib import Path
 
+import pytest
+import typer
+
 from assetmap import cli
 from assetmap.cli import pipeline as pipeline_cli
 from assetmap.cli import review as review_cli
-from assetmap.config import AppConfig
+from assetmap.config import AppConfig, DatabaseConfig
+from assetmap.db import create_db_and_engine, get_session
+from assetmap.models import WebEntrypoint
 
 
 def test_manual_import_next_command_quotes_paths_with_spaces():
     command = cli.manual_import_next_command(49, Path("data/manual assets.yaml"))
 
     assert command == 'assetmap run 49 --manual-file "data/manual assets.yaml"'
+
+
+def test_visual_gaps_include_http_probe_fallbacks(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(
+        WebEntrypoint(
+            scan_task_id=49,
+            host="fallback.example.cn",
+            url="https://fallback.example.cn/",
+            normalized_url="https://fallback.example.cn/",
+            evidence={"visual_analysis": {"analysis_method": "http_probe_fallback"}},
+        )
+    )
+    session.commit()
+
+    assert pipeline_cli._has_visual_gaps(session, 49)
 
 
 def test_run_pipeline_force_changed_runs_completed_downstream(monkeypatch):
@@ -218,6 +241,7 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
             return FakeVerification()
 
     monkeypatch.setattr(pipeline_cli, "DiscoveryService", FakeDiscoveryService)
+    monkeypatch.setattr(pipeline_cli, "_require_full_scan_environment", lambda *args: None)
     monkeypatch.setattr(pipeline_cli, "_run_pipeline", lambda *args, **kwargs: calls.append(f"pipeline:{args[2]}:{kwargs.get('manual_file')}"))
     monkeypatch.setattr(pipeline_cli, "DeliveryQualityService", FakeQualityService)
     monkeypatch.setattr(pipeline_cli, "DeliveryPackageService", FakePackageService)
@@ -239,4 +263,34 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
         "quality:49:reports",
         "package:49:reports:deliveries:False",
         "verify:deliveries/task_49.zip",
+    ]
+
+
+def test_one_click_scan_preflight_stops_before_external_collection(monkeypatch):
+    progress: list[str] = []
+
+    class FakeEnvironmentCheckService:
+        def __init__(self, config):
+            pass
+
+        def check(self):
+            return [
+                {
+                    "name": "fofa.credentials",
+                    "ok": False,
+                    "detail": "enabled but missing or placeholder",
+                    "suggestion": "Set fofa.email and fofa.api_key in config.yaml.",
+                }
+            ]
+
+    monkeypatch.setattr(pipeline_cli, "EnvironmentCheckService", FakeEnvironmentCheckService)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        pipeline_cli._require_full_scan_environment(AppConfig(), progress.append)
+
+    assert exc_info.value.exit_code == 2
+    assert progress == [
+        "[scan] preflight failed; no external collection was started.",
+        "[scan] missing fofa.credentials: enabled but missing or placeholder",
+        "[scan] suggestion: Set fofa.email and fofa.api_key in config.yaml.",
     ]

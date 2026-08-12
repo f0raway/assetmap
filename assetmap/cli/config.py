@@ -9,9 +9,9 @@ import typer
 
 from assetmap.config import DEFAULT_CONFIG_PATH, load_config, write_sample_config
 from assetmap.db import create_db_and_engine
-from assetmap.services.environment import EnvironmentCheckService
-from assetmap.services.ai_client import chat_completion
-from assetmap.services.manual_import import write_manual_asset_template
+from assetmap.services.runtime.environment import EnvironmentCheckService
+from assetmap.services.identification.ai_client import chat_completion
+from assetmap.services.acquisition.manual_import import write_manual_asset_template
 
 
 def register(app: typer.Typer) -> None:
@@ -37,7 +37,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         """TUI 配置向导：逐项配置 config.yaml"""
-        from assetmap.services.config_wizard import ConfigWizardService
+        from assetmap.services.runtime.config_wizard import ConfigWizardService
 
         service = ConfigWizardService(progress=typer.echo)
         success = service.run(config_path)
@@ -50,7 +50,7 @@ def register(app: typer.Typer) -> None:
         tools_dir: Path = typer.Option(Path("tools"), "--tools-dir", help="工具安装目录"),
     ):
         """安装外部工具：subfinder, dnsx, nmap"""
-        from assetmap.services.tool_install import ToolInstallService
+        from assetmap.services.runtime.tool_install import ToolInstallService
 
         service = ToolInstallService(tools_dir=tools_dir, progress=typer.echo)
         success = service.run(tools)

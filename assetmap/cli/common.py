@@ -10,8 +10,8 @@ from sqlmodel import select
 from assetmap.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsset, ScanTask, WebEntrypoint
-from assetmap.services.status import PipelineStatusService
-from assetmap.services.tool_resolver import ToolResolver
+from assetmap.services.operations.status import PipelineStatusService
+from assetmap.services.runtime.tool_resolver import ToolResolver
 
 
 PIPELINE_STAGES = ("subdomains", "port-scan", "classify", "url-discover", "report")
@@ -78,10 +78,13 @@ def _should_run_stage(stage_status: dict[str, str], stage: str, force: bool = Fa
 
 def _has_visual_gaps(session, task_id: int) -> bool:
     rows = session.exec(select(WebEntrypoint).where(WebEntrypoint.scan_task_id == task_id)).all()
-    return any(
-        not (row.evidence or {}).get("visual_analysis")
-        for row in rows
-    )
+    for row in rows:
+        visual = (row.evidence or {}).get("visual_analysis")
+        if not isinstance(visual, dict):
+            return True
+        if visual.get("analysis_method") == "http_probe_fallback":
+            return True
+    return False
 
 
 def _warn_environment(

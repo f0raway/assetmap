@@ -23,8 +23,8 @@ from assetmap.models import (
     ServiceAsset,
     WebProbeResult,
 )
-from assetmap.services.nmap_scan import _quote, _safe_ip
-from assetmap.services.tool_resolver import ToolResolver
+from assetmap.services.mapping.nmap_scan import _quote, _safe_ip
+from assetmap.services.runtime.tool_resolver import ToolResolver
 
 
 TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
@@ -699,7 +699,12 @@ class AssetClassifierService:
         parsed = urlparse(value)
         scheme = parsed.scheme if parsed.scheme in {"http", "https"} else protocol
         hostname = parsed.hostname or host.split(":", 1)[0]
-        actual_port = parsed.port or port
+        try:
+            actual_port = parsed.port or port
+        except ValueError:
+            # FOFA host fields are external input. Retain the verified Nmap
+            # port instead of letting an invalid textual port abort classify.
+            actual_port = port
         default_port = 443 if scheme == "https" else 80
         netloc = _host_for_url(hostname.lower().rstrip("."))
         if actual_port and actual_port != default_port:
@@ -756,9 +761,11 @@ class AssetClassifierService:
     def _detect_services(self, scan_task_id: int, ports: list[NmapPort], rerun: bool = False) -> None:
         grouped: dict[str, list[NmapPort]] = {}
         for port in ports:
+            if not self._needs_supplemental_service_detect(port):
+                continue
             grouped.setdefault(port.target_ip, []).append(port)
         if grouped:
-            self._log(f"[classify] high-intensity -sV targets: {len(grouped)} hosts")
+            self._log(f"[classify] supplemental -sV targets: {len(grouped)} hosts")
         for target_ip, host_ports in grouped.items():
             existing = [
                 self._service_asset(scan_task_id, port)
@@ -768,6 +775,27 @@ class AssetClassifierService:
                 self._log(f"[classify] skip service detect: {target_ip}")
                 continue
             self._detect_host_services(scan_task_id, target_ip, host_ports)
+
+    def _needs_supplemental_service_detect(self, port: NmapPort) -> bool:
+        """Only verify ports that were not already covered by a deep Nmap scan.
+
+        The default port-scan command includes ``-sV --version-intensity 5`` and
+        persists that result in ``NmapPort``. Repeating the same scan here for
+        every active result can double the longest stage of a task. FOFA-only
+        results, or projects that intentionally remove ``-sV`` from their Nmap
+        command, still need this focused verification before classification.
+        """
+        payload = port.raw_payload or {}
+        sources = payload.get("sources")
+        has_nmap_evidence = (
+            "nmap" in sources
+            if isinstance(sources, list)
+            else payload.get("source") == "nmap" or isinstance(payload.get("nmap"), dict)
+        )
+        if not has_nmap_evidence:
+            return True
+        command = self.config.tools.nmap_command.lower()
+        return "-sv" not in command and "--service-version" not in command and " -a" not in command
 
     def _detect_host_services(self, scan_task_id: int, target_ip: str, ports: list[NmapPort]) -> None:
         executable = ToolResolver(self.config.tools).nmap_executable()

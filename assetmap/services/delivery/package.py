@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import uuid
 import zipfile
 from io import BytesIO
 from dataclasses import dataclass
@@ -14,12 +15,12 @@ from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
 from assetmap.models import ScanTask, ServiceAsset, WebEntrypoint
-from assetmap.services.gap_template import GapTemplateService
-from assetmap.services.improvement_plan import ImprovementPlanService
-from assetmap.services.quality import DeliveryQualityService, EXPECTED_ASSET_SHEETS, EXPECTED_WEB_SHEETS
-from assetmap.services.report import _safe_name
-from assetmap.services.review_workorder import ReviewWorkOrderService
-from assetmap.services.asset_classifier import AssetClassifierService
+from assetmap.services.operations.gap_template import GapTemplateService
+from assetmap.services.operations.improvement_plan import ImprovementPlanService
+from assetmap.services.delivery.quality import DeliveryQualityService, EXPECTED_ASSET_SHEETS, EXPECTED_WEB_SHEETS
+from assetmap.services.delivery.report import _safe_name
+from assetmap.services.operations.review_workorder import ReviewWorkOrderService
+from assetmap.services.identification.asset_classifier import AssetClassifierService
 
 
 @dataclass
@@ -65,78 +66,98 @@ class DeliveryPackageService:
         if strict and quality.warnings:
             raise ValueError("严格模式下存在质量警告，不能打包: " + "; ".join(quality.warnings))
 
-        package_dir = Path(output_dir) / f"task_{task.id}_{_safe_name(task.target)}"
-        if package_dir.exists():
-            shutil.rmtree(package_dir)
-        package_dir.mkdir(parents=True, exist_ok=True)
+        final_package_dir = Path(output_dir) / f"task_{task.id}_{_safe_name(task.target)}"
+        final_zip_path = final_package_dir.with_suffix(".zip")
+        token = uuid.uuid4().hex
+        package_dir = final_package_dir.with_name(f".{final_package_dir.name}.building-{token}")
+        staging_zip_path = final_zip_path.with_name(f".{final_zip_path.name}.building-{token}")
+        package_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            report_paths = DeliveryQualityService(self.session, self.config)._report_paths(task, reports_dir)
+            copied: list[Path] = []
+            for source in report_paths.values():
+                copied.append(self._copy(source, package_dir / source.name))
 
-        report_paths = DeliveryQualityService(self.session, self.config)._report_paths(task, reports_dir)
-        copied: list[Path] = []
-        for source in report_paths.values():
-            copied.append(self._copy(source, package_dir / source.name))
+            quality_path = package_dir / "quality_summary.txt"
+            quality_path.write_text("\n".join(quality.lines) + "\n", encoding="utf-8")
+            copied.append(quality_path)
 
-        quality_path = package_dir / "quality_summary.txt"
-        quality_path.write_text("\n".join(quality.lines) + "\n", encoding="utf-8")
-        copied.append(quality_path)
-
-        if include_gap_template:
-            gap_path = package_dir / f"task_{task.id}_待补充资产模板.yaml"
-            GapTemplateService(self.session, self.config).write(
+            if include_gap_template:
+                gap_path = package_dir / f"task_{task.id}_待补充资产模板.yaml"
+                GapTemplateService(self.session, self.config).write(
+                    task.id,
+                    gap_path,
+                    include_partial=include_partial_gaps,
+                    priority_filter="high-medium",
+                    force=True,
+                )
+                copied.append(gap_path)
+            if include_review_workorder:
+                review_path = package_dir / f"task_{task.id}_复核工作单.yaml"
+                ReviewWorkOrderService(self.session, self.config).write(task.id, review_path, force=True)
+                copied.append(review_path)
+            plan = ImprovementPlanService(self.session, self.config).write(
                 task.id,
-                gap_path,
-                include_partial=include_partial_gaps,
-                priority_filter="high-medium",
-                force=True,
+                output_dir=package_dir,
+                reports_dir=reports_dir,
             )
-            copied.append(gap_path)
-        if include_review_workorder:
-            review_path = package_dir / f"task_{task.id}_复核工作单.yaml"
-            ReviewWorkOrderService(self.session, self.config).write(task.id, review_path, force=True)
-            copied.append(review_path)
-        plan = ImprovementPlanService(self.session, self.config).write(
-            task.id,
-            output_dir=package_dir,
-            reports_dir=reports_dir,
-        )
-        plan_json = plan.json_path.rename(package_dir / f"task_{task.id}_补全计划.json")
-        plan_text = plan.text_path.rename(package_dir / f"task_{task.id}_补全计划.txt")
-        copied.extend([plan_json, plan_text])
-        copied.extend(self._copy_subdomain_audit_files(task.id, package_dir))
-        copied.extend(self._copy_port_audit_files(task.id, package_dir))
-        copied.extend(self._copy_classification_audit_files(task.id, package_dir))
-        copied.extend(self._copy_visual_audit_files(task.id, package_dir))
-        copied.extend(self._copy_report_audit_files(task.id, package_dir))
-        copied.extend(self._copy_screenshot_evidence(task.id, package_dir))
-        readme_path = package_dir / "交付说明.txt"
-        readme_path.write_text(self._delivery_readme(task, quality.status, quality.warnings, copied), encoding="utf-8")
-        copied.append(readme_path)
+            plan_json = plan.json_path.rename(package_dir / f"task_{task.id}_补全计划.json")
+            plan_text = plan.text_path.rename(package_dir / f"task_{task.id}_补全计划.txt")
+            copied.extend([plan_json, plan_text])
+            copied.extend(self._copy_subdomain_audit_files(task.id, package_dir))
+            copied.extend(self._copy_port_audit_files(task.id, package_dir))
+            copied.extend(self._copy_classification_audit_files(task.id, package_dir))
+            copied.extend(self._copy_visual_audit_files(task.id, package_dir))
+            copied.extend(self._copy_report_audit_files(task.id, package_dir))
+            copied.extend(self._copy_screenshot_evidence(task.id, package_dir))
+            readme_path = package_dir / "交付说明.txt"
+            readme_path.write_text(self._delivery_readme(task, quality.status, quality.warnings, copied), encoding="utf-8")
+            copied.append(readme_path)
 
-        manifest_path = package_dir / "manifest.json"
-        files = [self._file_record(path, package_dir) for path in copied]
-        manifest = {
-            "task_id": task.id,
-            "target": task.target,
-            "quality_status": quality.status,
-            "warnings": quality.warnings,
-            "files": files,
-        }
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        packaged_files = [*files, self._file_record(manifest_path, package_dir)]
+            manifest_path = package_dir / "manifest.json"
+            files = [self._file_record(path, package_dir) for path in copied]
+            manifest = {
+                "task_id": task.id,
+                "target": task.target,
+                "quality_status": quality.status,
+                "warnings": quality.warnings,
+                "files": files,
+            }
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            packaged_files = [*files, self._file_record(manifest_path, package_dir)]
+            with zipfile.ZipFile(staging_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in [*copied, manifest_path]:
+                    archive.write(path, path.relative_to(package_dir).as_posix())
 
-        zip_path = package_dir.with_suffix(".zip")
-        if zip_path.exists():
-            zip_path.unlink()
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in [*copied, manifest_path]:
-                archive.write(path, path.relative_to(package_dir).as_posix())
-        return DeliveryPackageResult(
-            package_dir=package_dir,
-            zip_path=zip_path,
-            manifest_path=manifest_path,
-            quality_status=quality.status,
-            files=files,
-            packaged_files=packaged_files,
-        )
+            backup_dir = None
+            if final_package_dir.exists():
+                backup_dir = final_package_dir.with_name(f".{final_package_dir.name}.previous-{token}")
+                final_package_dir.replace(backup_dir)
+            try:
+                package_dir.replace(final_package_dir)
+                staging_zip_path.replace(final_zip_path)
+            except Exception:
+                if final_package_dir.exists():
+                    shutil.rmtree(final_package_dir)
+                if backup_dir and backup_dir.exists():
+                    backup_dir.replace(final_package_dir)
+                raise
+            if backup_dir and backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            return DeliveryPackageResult(
+                package_dir=final_package_dir,
+                zip_path=final_zip_path,
+                manifest_path=final_package_dir / manifest_path.name,
+                quality_status=quality.status,
+                files=files,
+                packaged_files=packaged_files,
+            )
+        except Exception:
+            if package_dir.exists():
+                shutil.rmtree(package_dir)
+            if staging_zip_path.exists():
+                staging_zip_path.unlink()
+            raise
 
     def _copy(self, source: Path, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)

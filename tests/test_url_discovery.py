@@ -7,7 +7,7 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import ServiceAsset, WebEntrypoint, WebProbeResult
-from assetmap.services.url_discovery import UrlDiscoveryService, _clean_ai_text, _looks_blank, _page_state_summary
+from assetmap.services.identification.url_discovery import UrlDiscoveryService, _clean_ai_text, _looks_blank, _page_state_summary
 
 
 def test_seed_web_probe_as_entrypoint(tmp_path: Path):
@@ -109,7 +109,7 @@ def test_visual_ai_retries_when_json_is_truncated(tmp_path: Path, monkeypatch):
             return {"choices": [{"finish_reason": "length", "message": {"content": '{"system_name": "截断'}}]}
         return {"choices": [{"finish_reason": "stop", "message": {"content": '{"system_name": "统一门户", "confidence": 0.9}'}}]}
 
-    monkeypatch.setattr("assetmap.services.url_discovery.chat_completion", fake_chat_completion)
+    monkeypatch.setattr("assetmap.services.identification.url_discovery.chat_completion", fake_chat_completion)
 
     analysis = UrlDiscoveryService(session, config)._analyze_with_ai(entry, screenshot)
 
@@ -243,6 +243,14 @@ def test_pending_entrypoints_skip_recorded_visual_errors(tmp_path: Path):
     assert service._pending_entrypoints(1, rerun=False) == []
     assert len(service._pending_entrypoints(1, rerun=False, retry_failed=True)) == 1
     assert len(service._pending_entrypoints(1, rerun=True)) == 1
+
+
+def test_normalize_url_skips_invalid_textual_port(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+
+    assert UrlDiscoveryService(session, config)._normalize_url("https://portal.example.cn:not-a-port/") is None
 
 
 def test_pending_entrypoints_retry_probe_fallbacks(tmp_path: Path):
@@ -656,3 +664,58 @@ def test_reuse_duplicate_visual_analysis_by_body_hash(tmp_path: Path):
     assert rows["b.example.cn"].evidence["visual_analysis"]["system_name"] == "A"
     assert rows["b.example.cn"].evidence["visual_analysis"]["analysis_method"] == "duplicate_reuse"
     assert "visual_analysis_error" not in rows["b.example.cn"].evidence
+
+
+def test_screenshot_reads_worker_result_without_using_unreliable_queue_empty(tmp_path: Path, monkeypatch):
+    class FakeQueue:
+        closed = False
+        joined = False
+
+        def empty(self):
+            return True
+
+        def get(self, timeout):
+            assert timeout == 1
+            return {"ok": True, "screenshot": str(tmp_path / "page.png"), "final_url": "https://example.cn/"}
+
+        def close(self):
+            self.closed = True
+
+        def join_thread(self):
+            self.joined = True
+
+    class FakeProcess:
+        exitcode = 0
+
+        def start(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    queue = FakeQueue()
+
+    class FakeContext:
+        def Queue(self):
+            return queue
+
+        def Process(self, target, args):
+            return FakeProcess()
+
+    monkeypatch.setattr("assetmap.services.identification.url_discovery.mp.get_context", lambda mode: FakeContext())
+    service = UrlDiscoveryService(None, AppConfig())  # type: ignore[arg-type]
+    entry = WebEntrypoint(
+        host="example.cn",
+        url="https://example.cn/",
+        normalized_url="https://example.cn/",
+    )
+
+    screenshot, final_url = service._screenshot(entry, tmp_path)
+
+    assert screenshot == tmp_path / "page.png"
+    assert final_url == "https://example.cn/"
+    assert queue.closed is True
+    assert queue.joined is True

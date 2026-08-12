@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from assetmap.config import AppConfig, DatabaseConfig
-from assetmap.services.environment import EnvironmentCheckService, _configured_secret
+from assetmap.services.runtime.environment import EnvironmentCheckService, _configured_secret
 
 
 def test_configured_secret_rejects_placeholders():
@@ -12,12 +12,13 @@ def test_configured_secret_rejects_placeholders():
 
 
 def test_environment_check_reports_configured_and_disabled_states(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("assetmap.services.environment._module_available", lambda module: False if module == "playwright.sync_api" else True)
+    monkeypatch.setattr("assetmap.services.runtime.environment._module_available", lambda module: False if module == "playwright.sync_api" else True)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.enscan.script = str(tmp_path / "tyc.py")
     config.tools.wordlist = str(tmp_path / "Subdomain.txt")
     config.tools.subdomain_tools_enabled = []
     config.port_scan.sources_enabled = []
+    config.ai.enabled = False
     config.url_discovery.browser_channel = "chromium"
 
     results = {row["name"]: row for row in EnvironmentCheckService(config).check()}

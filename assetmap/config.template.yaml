@@ -38,7 +38,7 @@ tools:
   wordlist: data/wordlists/Subdomain.txt
   # 唯一的主扫描命令：一次对全部目标 IP 执行全端口服务识别。
   # 支持占位符：{binary}、{targets_file}、{xml_output}、{normal_output}。
-  nmap_command: '{binary} -Pn -p- --open --min-hostgroup 16 --min-rate 500 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit --max-retries 2 --host-timeout 3600s -iL {targets_file} -oX {xml_output} -oN {normal_output}'
+  nmap_command: '{binary} -Pn -p- --open -sV --version-intensity 5 --min-hostgroup 16 --min-rate 500 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit --max-retries 2 --host-timeout 3600s -iL {targets_file} -oX {xml_output} -oN {normal_output}'
   # FOFA 发现的端口会用此命令再次确认服务信息。
   nmap_service_detect_command: '{binary} -Pn -sV --version-intensity 5 -p {ports} {target} -oX {xml_output} -oN {normal_output}'
   # 仅用于并发执行 FOFA 端口复核；主扫描始终是一次批量任务。

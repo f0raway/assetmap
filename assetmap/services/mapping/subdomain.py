@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
+import shlex
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -27,8 +29,8 @@ from assetmap.models import (
     SubdomainRecord,
     SubdomainToolRun,
 )
-from assetmap.services.ai_client import chat_completion
-from assetmap.services.tool_resolver import ToolResolver
+from assetmap.services.identification.ai_client import chat_completion
+from assetmap.services.runtime.tool_resolver import ToolResolver
 from assetmap.utils import stable_hash
 
 
@@ -55,8 +57,10 @@ def _safe_name(value: str) -> str:
 
 
 def _quote(value: str) -> str:
-    escaped = value.replace('"', '\\"')
-    return f'"{escaped}"'
+    """Quote runtime values before interpolating them into a configured shell command."""
+    if os.name == "nt":
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
 
 
 def normalize_hostname(value: str) -> str | None:
@@ -291,7 +295,7 @@ class SubdomainService:
     def _format_command(self, template: str, tool_name: str, domain: str, output: Path) -> str:
         return template.format(
             binary=_quote(self._binary_path(tool_name)),
-            domain=domain,
+            domain=_quote(domain),
             output=_quote(str(output)),
             wordlist=_quote(self.config.tools.wordlist),
         )
@@ -300,6 +304,7 @@ class SubdomainService:
         jobs: list[SubdomainToolRun] = []
         output_root = Path("data") / "subdomains" / f"task_{scan_task_id}"
         enabled_tools = self._enabled_subdomain_tools()
+        self._log_subfinder_provider_hint(enabled_tools)
         for domain in root_domains:
             for tool_name, template in enabled_tools:
                 output = output_root / _safe_name(domain) / f"{tool_name}.txt"
@@ -311,17 +316,20 @@ class SubdomainService:
                     self._format_command(template, tool_name, domain, output),
                     output,
                 )
-                if run.status in {"completed", "failed"} and not rerun_tools:
-                    if run.status == "failed" and self._is_interrupted_tool_run(run):
+                if run.status == "completed" and not rerun_tools:
+                    self._log(f"[subdomain] skip completed {tool_name}: {domain}")
+                    continue
+                if run.status == "failed" and not rerun_tools:
+                    if self._is_interrupted_tool_run(run):
                         self._log(f"[subdomain] recover interrupted {tool_name}: {domain}")
-                        run.status = "pending"
                         run.error_message = "Recovered from previous Ctrl+C interruption"
-                        run.exit_code = None
-                        self.session.add(run)
-                        self.session.commit()
-                        jobs.append(run)
-                        continue
-                    self._log(f"[subdomain] skip {run.status} {tool_name}: {domain}")
+                    else:
+                        self._log(f"[subdomain] retry failed {tool_name}: {domain}")
+                    run.status = "pending"
+                    run.exit_code = None
+                    self.session.add(run)
+                    self.session.commit()
+                    jobs.append(run)
                     continue
                 if run.status == "running" and not rerun_tools:
                     self._log(f"[subdomain] skip running {tool_name}: {domain} (use --rerun-tools to restart)")
@@ -341,6 +349,18 @@ class SubdomainService:
             futures = [executor.submit(self._run_tool_job, run.id) for run in jobs if run.id]
             for future in as_completed(futures):
                 future.result()
+
+    def _log_subfinder_provider_hint(self, enabled_tools: list[tuple[str, str]]) -> None:
+        if not any(tool_name == "subfinder" for tool_name, _ in enabled_tools):
+            return
+        self._log(
+            "[subfinder] 提示：未配置 provider API Key 仍可运行，但被动子域名覆盖率会明显下降。"
+        )
+        self._log(
+            "[subfinder] 建议：在 macOS/Linux 的 ~/.config/subfinder/provider-config.yaml 配置自己的 provider Key，"
+            "或通过 -pc / SUBFINDER_PROVIDER_CONFIG 指定文件；可优先配置 Chaos、Censys、FOFA、GitHub、"
+            "SecurityTrails、Shodan、ZoomEye、VirusTotal。请勿在终端、报告或仓库中粘贴 Key。"
+        )
 
     def _is_interrupted_tool_run(self, run: SubdomainToolRun) -> bool:
         if run.exit_code in INTERRUPTED_EXIT_CODES:

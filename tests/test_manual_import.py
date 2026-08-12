@@ -7,12 +7,12 @@ from sqlmodel import select
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import AiAnalysis, Company, CompanyAssetLink, CompanyEdge, DnsRecord, InternetAsset, NmapPort, NmapScanRun, ScanTask, SourceRawRecord, SubdomainRecord, WebEntrypoint
-from assetmap.services.manual_import import ManualAssetImportService, write_manual_asset_template
-from assetmap.services.maintenance import MaintenanceService
-from assetmap.services.fofa import FofaClient, FofaPort
-from assetmap.services.nmap_scan import NMAP_FOFA_VALIDATION_PREFIX, NmapScanService
-from assetmap.services.exporter import ExportService
-from assetmap.services.report import ReportService
+from assetmap.services.acquisition.manual_import import ManualAssetImportService, write_manual_asset_template
+from assetmap.services.operations.maintenance import MaintenanceService
+from assetmap.services.mapping.fofa import FofaClient, FofaPort
+from assetmap.services.mapping.nmap_scan import NMAP_FOFA_VALIDATION_PREFIX, NmapScanService
+from assetmap.services.delivery.exporter import ExportService
+from assetmap.services.delivery.report import ReportService
 
 
 def test_manual_import_adds_full_asset_set(tmp_path: Path):
@@ -816,7 +816,7 @@ def test_fofa_failures_are_logged_without_breaking_nmap_source(tmp_path: Path, m
         def search_ip_ports(self, ip: str):
             raise RuntimeError(f"timeout for {ip}")
 
-    monkeypatch.setattr("assetmap.services.nmap_scan.FofaClient", BrokenFofaClient)
+    monkeypatch.setattr("assetmap.services.mapping.nmap_scan.FofaClient", BrokenFofaClient)
 
     NmapScanService(session, config, progress=logs.append)._run_fofa(1, ["8.8.8.8"], required=False)
 
@@ -839,7 +839,7 @@ def test_fofa_only_mode_fails_when_all_passive_lookups_fail(tmp_path: Path, monk
         def search_ip_ports(self, ip: str):
             raise RuntimeError(f"timeout for {ip}")
 
-    monkeypatch.setattr("assetmap.services.nmap_scan.FofaClient", BrokenFofaClient)
+    monkeypatch.setattr("assetmap.services.mapping.nmap_scan.FofaClient", BrokenFofaClient)
 
     service = NmapScanService(session, config)
     try:
