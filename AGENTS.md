@@ -1,6 +1,6 @@
 # AGENTS.md — assetmap
 
-Chinese-language cybersecurity asset-mapping CLI. Python 3.9+, Typer CLI, SQLModel/SQLite, Pydantic v2 config, httpx, openpyxl, python-docx. Orchestrate external tools (subfinder, dnsx, nmap), FOFA API, Playwright screenshots, and an OpenAI-compatible AI gateway into a resumable pipeline that produces Word/Excel deliverables.
+Chinese-language cybersecurity asset-mapping CLI. Python 3.9+, Typer CLI, SQLModel/SQLite, Pydantic v2 config, httpx, openpyxl, python-docx. Orchestrate external tools (subfinder, dnsx, nmap), FOFA API, Playwright-rendered HTML, and an OpenAI-compatible AI gateway into a resumable pipeline that produces Word/Excel deliverables.
 
 ## Setup
 
@@ -14,7 +14,7 @@ assetmap env-check                  # verify external tool availability
 assetmap ai-check                   # verify AI endpoint connectivity
 ```
 
-`config.yaml` is gitignored. Copy from `config.example.yaml` or let `assetmap init` generate it. Requires real values for: `enscan.tycid`, `enscan.auth_token`, `fofa.email`, `fofa.api_key`, `ai.base_url`, `ai.api_key`.
+`config.yaml` is gitignored. Copy from `config.example.yaml` or let `assetmap init` generate it. Requires real values for: `enterprise_discovery.tycid`, `enterprise_discovery.auth_token`, `fofa.email`, `fofa.api_key`, `ai.base_url`, `ai.api_key`.
 
 ## Commands
 
@@ -54,7 +54,7 @@ assetmap asset-gap-template <task_id> --priority high-medium --include-partial -
 
 # 新增命令
 assetmap configure                                # TUI 配置向导：交互式配置 API 密钥
-assetmap install-tools                            # 安装外部工具：subfinder, dnsx, nmap
+assetmap install-tools                            # 安装外部工具：subfinder, dnsx, nmap, httpx
 assetmap install-tools subfinder                  # 只安装特定工具
 assetmap env-check                                # 检查环境依赖（改进后的友好输出）
 ```
@@ -66,7 +66,7 @@ assetmap env-check                                # 检查环境依赖（改进�
 3. `subdomains` — subfinder (passive) + dnsx (active wordlist discovery and DNS resolution) → AI judges real server IPs
 4. `port-scan` — nmap (active) + FOFA (passive), merged/deduped
 5. `classify` — Service identification → Web URL entry generation
-6. `url-discover` — Playwright screenshots → multimodal AI recognition
+6. `url-discover` — Playwright rendered HTML/DOM → text AI recognition
 7. `report` — 4-chunk AI analysis (DNS, ports, Web, overall) → Word + 2 Excel files
 8. `quality-check` → `deliver`
 
@@ -88,7 +88,15 @@ assetmap/
 ├── models.py               # DB models: Company, ScanTask, InternetAsset, CompanyEdge, etc.
 ├── utils.py
 ├── collectors/
-│   └── tyc_invest_crawler.py   # ENScan/TYC corporate data collector (configurable via enscan.script)
+│   └── tyc_invest_crawler.py   # Built-in TYC corporate data collector
+├── stages/                     # Independently runnable production stages and pipeline
+│   ├── enterprise_discovery.py
+│   ├── domain_mapping.py
+│   ├── port_discovery.py
+│   ├── service_identification.py
+│   ├── web_identification.py
+│   ├── report_generation.py
+│   └── pipeline.py
 └── services/               # Grouped by business capability
     ├── acquisition/        # enterprise discovery and manual asset import
     ├── mapping/            # subdomains, DNS, FOFA and port discovery
@@ -101,9 +109,9 @@ assetmap/
 ## Key Conventions
 
 - **Breakpoint resume is default.** Same company name → reuses last task. Use `--refresh` to restart. `run` without `--rerun-*` only processes incomplete/stale stages.
-- **External tools** live in `tools/{subfinder,dnsx,nmap}/`. `runtime/tool_resolver.py` finds binaries. Commands are templated in `config.yaml` with `{binary}`, `{domain}`, `{output}`, `{target}`, `{wordlist}`, `{xml_output}`, `{normal_output}`, `{targets_file}`, `{ports}` placeholders.
-- **AI client** (`identification/ai_client.py`) is OpenAI-compatible. Config: `ai.base_url`, `ai.api_key`, `ai.api_key_header` (default `api-key`), `ai.model`. Used for DNS IP judgment, visual screenshot analysis, and report generation.
-- **Data directory** (`data/`) is mostly gitignored. Tracked: `data/wordlists/`, `data/manual_assets.example.yaml`. Generated: `data/assetmap.db`, `data/enscan/`, `data/subdomains/`, `data/nmap/`, `data/classify/`, `data/screenshots/`, `data/report/`.
+- **External tools** live in `tools/{subfinder,dnsx,httpx}/`; Nmap is located from the system `PATH` or `tools/nmap/` when needed. `runtime/tool_resolver.py` finds binaries. Commands are templated in `config.yaml` with `{binary}`, `{domain}`, `{output}`, `{target}`, `{wordlist}`, `{xml_output}`, `{normal_output}`, `{targets_file}`, `{ports}` placeholders.
+- **AI client** (`identification/ai_client.py`) is OpenAI-compatible. Config: `ai.base_url`, `ai.api_key`, `ai.api_key_header` (default `api-key`), `ai.model`. Used for DNS IP judgment, rendered HTML text analysis, and report generation.
+- **Data directory** (`data/`) is mostly gitignored. Tracked: `data/wordlists/`, `data/manual_assets.example.yaml`. Generated: `data/assetmap.db`, `data/enterprise_discovery/`, `data/subdomains/`, `data/nmap/`, `data/classify/`, `data/rendered_html/`, `data/report/`.
 - **Report output** goes to `reports/task_<task_id>_<target>/`. Delivery zips go to `deliveries/`.
 - **Quality gate**: PASS = deliverable; WARN = deliverable with gaps (review workorder + improvement plan attached); FAIL = must fix before delivery. `--strict` turns WARN into a hard stop.
 - **All user-facing output and docs are in Chinese.** Code comments and variable names are in English.
@@ -126,4 +134,4 @@ No special fixtures or services required for unit tests. Integration tests that 
 - Do NOT invent pipeline stage names — they are exactly: `subdomains`, `port-scan`, `classify`, `url-discover`, `report` (see `PIPELINE_STAGES` in `cli/common.py`).
 - Do NOT skip `--rerun-*` flags when you want to redo a stage — `run` alone is incremental.
 - Do NOT treat WARN from quality-check as a failure — it's expected for partial coverage.
-- Wordlist path is configured at `tools.wordlist` (default `data/wordlists/Subdomain.txt`).
+- Wordlist path is configured at `domain_mapping.dnsx_wordlist` (default `data/wordlists/Subdomain.txt`).

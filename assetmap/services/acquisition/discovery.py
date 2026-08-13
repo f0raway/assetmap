@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-import json
-import os
 import re
-import subprocess
-import sys
-import threading
-import time
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +10,7 @@ from typing import Any, Callable
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from assetmap.collectors.tyc_invest_crawler import ClientOptions, CrawlOptions, RunOptions, run_crawl
 from assetmap.config import AppConfig
 from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsset, ScanTask, SourceRawRecord
 from assetmap.services.operations.maintenance import MaintenanceService
@@ -42,6 +37,8 @@ ASSET_TYPES = {
     "mini_program": "mini_program",
 }
 
+ENTERPRISE_DISCOVERY_OUTPUT_DIR = Path("data/enterprise_discovery")
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -49,16 +46,6 @@ def _utcnow() -> datetime:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
-
-
-def _redact_command(command: list[str]) -> list[str]:
-    redacted = list(command)
-    for option in ("--tycid", "--auth-token"):
-        if option in redacted:
-            index = redacted.index(option)
-            if index + 1 < len(redacted):
-                redacted[index + 1] = "***"
-    return redacted
 
 
 def _company_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -316,104 +303,63 @@ class DiscoveryService:
         ).first()
 
     def _run_collector(self, task_id: int, target: str, fresh: bool = False) -> dict[str, Any]:
-        output_path = (Path(self.config.enscan.output_dir) / f"task_{task_id}.json").resolve()
+        """Run the bundled collector in-process so credentials never enter argv."""
+        output_path = (ENTERPRISE_DISCOVERY_OUTPUT_DIR / f"task_{task_id}.json").resolve()
         csv_dir = output_path.with_suffix("")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        tycid = self.config.enscan.tycid.strip()
-        auth_token = self.config.enscan.auth_token.strip()
-        command = [
-            sys.executable,
-            str(Path(self.config.enscan.script)),
-            "--name",
-            target,
-            "--tycid",
-            tycid,
-            "--auth-token",
-            auth_token,
-            "--output",
-            str(output_path),
-            "--csv-dir",
-            str(csv_dir),
-            "--max-depth",
-            str(self.config.org.max_depth),
-            "--threshold",
-            str(self.config.org.control_threshold * 100),
-            "--delay",
-            str(self.config.enscan.request_delay_seconds),
-            "--timeout",
-            str(self.config.enscan.request_timeout_seconds),
-            "--asset-workers",
-            str(self.config.enscan.asset_workers),
-        ]
-        if fresh:
-            command.append("--fresh")
-        if self.config.enscan.verbose:
-            command.append("--verbose")
-        if tycid.startswith("YOUR_") or auth_token.startswith("YOUR_"):
-            raise ValueError("Please set enscan.tycid and enscan.auth_token in config.yaml before running discover.")
-        safe_command = _redact_command(command)
-        self._log(f"[enscan] running: {' '.join(safe_command)}")
-        returncode, output_tail = self._run_process_streaming(command)
+        settings = self.config.enterprise_discovery
+        tycid = settings.tycid.strip()
+        auth_token = settings.auth_token.strip()
+        missing_credentials = []
+        if not tycid or tycid.startswith("YOUR_"):
+            missing_credentials.append("enterprise_discovery.tycid")
+        if not auth_token or auth_token.startswith("YOUR_"):
+            missing_credentials.append("enterprise_discovery.auth_token")
+        if missing_credentials:
+            raise ValueError(
+                "企业发现尚未配置有效的天眼查凭证："
+                f"{', '.join(missing_credentials)}。"
+                "请在 config.yaml 的 enterprise_discovery 段填写；密钥不会显示在日志中。"
+            )
+
+        def collector_progress(event: str, payload: dict[str, Any]) -> None:
+            name = _text(payload.get("name"))
+            if event == "company_started":
+                self._log(f"[enterprise-discovery] collecting depth={payload.get('depth')} company={name}")
+            elif event == "company_completed":
+                self._log(f"[enterprise-discovery] completed company={name}; waiting={payload.get('queued', 0)}")
+            elif event == "blocked":
+                self._log(f"[enterprise-discovery] blocked company={name}: {_text(payload.get('error'))}")
+
+        self._log(
+            "[enterprise-discovery] start bundled Tianyancha collector "
+            f"(threshold>={settings.control_threshold:.2f}, max_depth={settings.max_depth})"
+        )
+        result = run_crawl(
+            ClientOptions(tycid=tycid, auth_token=auth_token),
+            CrawlOptions(
+                threshold=settings.control_threshold * 100,
+                max_depth=settings.max_depth,
+            ),
+            RunOptions(
+                name=target,
+                output=output_path,
+                csv_dir=csv_dir,
+                fresh=fresh,
+            ),
+            progress=collector_progress,
+        )
+        payload = asdict(result)
         self._record_raw(
             task_id,
-            "process",
-            {"command": safe_command, "output": str(output_path)},
+            "collector",
+            {"provider": "tianyancha", "output": str(output_path)},
             {
-                "returncode": returncode,
-                "stdout": output_tail,
-                "stderr": "",
+                "criteria": payload.get("criteria") or {},
+                "crawler_state": payload.get("crawler_state") or {},
             },
         )
-        if returncode != 0:
-            detail = output_tail.strip()
-            raise RuntimeError(f"ENScan failed with exit code {returncode}: {detail[-1000:]}")
-        return json.loads(output_path.read_text(encoding="utf-8"))
-
-    def _run_process_streaming(self, command: list[str]) -> tuple[int, str]:
-        started_at = time.monotonic()
-        lines: deque[str] = deque(maxlen=800)
-        timed_out = False
-
-        def kill_on_timeout() -> None:
-            nonlocal timed_out
-            if proc.poll() is None:
-                timed_out = True
-                proc.kill()
-
-        proc = subprocess.Popen(
-            command,
-            cwd=Path.cwd(),
-            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        timer = threading.Timer(self.config.enscan.timeout_seconds, kill_on_timeout)
-        timer.daemon = True
-        timer.start()
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                lines.append(line)
-                self._log(line.rstrip())
-            returncode = proc.wait()
-            output_tail = "".join(lines)[-20000:]
-            if timed_out:
-                elapsed = int(time.monotonic() - started_at)
-                raise TimeoutError(f"ENScan timed out after {elapsed}s")
-            return returncode, output_tail
-        except KeyboardInterrupt:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            raise
-        finally:
-            timer.cancel()
+        return payload
 
     def _save_result(self, task_id: int, payload: dict[str, Any]) -> None:
         self._clear_source_links(task_id, "enscan_python")
@@ -574,7 +520,7 @@ class DiscoveryService:
         ratio = extract_percent(record.get("percent_value") or record.get("percent"))
         parent = companies.get(_text(record.get("from_pid")))
         child = companies.get(_text(record.get("to_pid")))
-        if not parent or not child or ratio is None or ratio <= self.config.org.control_threshold:
+        if not parent or not child or ratio is None or ratio < self.config.enterprise_discovery.control_threshold:
             return
         exists = self.session.exec(
             select(CompanyEdge).where(

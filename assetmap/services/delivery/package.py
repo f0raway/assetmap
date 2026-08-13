@@ -55,6 +55,7 @@ class DeliveryPackageService:
         include_gap_template: bool = True,
         include_review_workorder: bool = True,
         include_partial_gaps: bool = True,
+        include_internal_evidence: bool = False,
         strict: bool = False,
     ) -> DeliveryPackageResult:
         task = self.session.get(ScanTask, task_id)
@@ -78,11 +79,15 @@ class DeliveryPackageService:
             for source in report_paths.values():
                 copied.append(self._copy(source, package_dir / source.name))
 
-            quality_path = package_dir / "quality_summary.txt"
-            quality_path.write_text("\n".join(quality.lines) + "\n", encoding="utf-8")
+            quality_path = package_dir / "质量摘要.txt"
+            quality_path.write_text(self._client_quality_summary(task, quality), encoding="utf-8")
             copied.append(quality_path)
 
-            if include_gap_template:
+            # Raw evidence, troubleshooting logs and operator work orders are
+            # deliberately opt-in.  A normal delivery archive is suitable for
+            # the customer to retain and forward without leaking local paths or
+            # internal service diagnostics.
+            if include_internal_evidence and include_gap_template:
                 gap_path = package_dir / f"task_{task.id}_待补充资产模板.yaml"
                 GapTemplateService(self.session, self.config).write(
                     task.id,
@@ -92,26 +97,30 @@ class DeliveryPackageService:
                     force=True,
                 )
                 copied.append(gap_path)
-            if include_review_workorder:
+            if include_internal_evidence and include_review_workorder:
                 review_path = package_dir / f"task_{task.id}_复核工作单.yaml"
                 ReviewWorkOrderService(self.session, self.config).write(task.id, review_path, force=True)
                 copied.append(review_path)
-            plan = ImprovementPlanService(self.session, self.config).write(
-                task.id,
-                output_dir=package_dir,
-                reports_dir=reports_dir,
-            )
-            plan_json = plan.json_path.rename(package_dir / f"task_{task.id}_补全计划.json")
-            plan_text = plan.text_path.rename(package_dir / f"task_{task.id}_补全计划.txt")
-            copied.extend([plan_json, plan_text])
-            copied.extend(self._copy_subdomain_audit_files(task.id, package_dir))
-            copied.extend(self._copy_port_audit_files(task.id, package_dir))
-            copied.extend(self._copy_classification_audit_files(task.id, package_dir))
-            copied.extend(self._copy_visual_audit_files(task.id, package_dir))
-            copied.extend(self._copy_report_audit_files(task.id, package_dir))
-            copied.extend(self._copy_screenshot_evidence(task.id, package_dir))
+            if include_internal_evidence:
+                plan = ImprovementPlanService(self.session, self.config).write(
+                    task.id,
+                    output_dir=package_dir,
+                    reports_dir=reports_dir,
+                )
+                plan_json = plan.json_path.rename(package_dir / f"task_{task.id}_补全计划.json")
+                plan_text = plan.text_path.rename(package_dir / f"task_{task.id}_补全计划.txt")
+                copied.extend([plan_json, plan_text])
+                copied.extend(self._copy_subdomain_audit_files(task.id, package_dir))
+                copied.extend(self._copy_port_audit_files(task.id, package_dir))
+                copied.extend(self._copy_classification_audit_files(task.id, package_dir))
+                copied.extend(self._copy_visual_audit_files(task.id, package_dir))
+                copied.extend(self._copy_report_audit_files(task.id, package_dir))
+                copied.extend(self._copy_rendered_html_evidence(task.id, package_dir))
             readme_path = package_dir / "交付说明.txt"
-            readme_path.write_text(self._delivery_readme(task, quality.status, quality.warnings, copied), encoding="utf-8")
+            readme_path.write_text(
+                self._delivery_readme(task, quality.status, quality.warnings, copied, internal=include_internal_evidence),
+                encoding="utf-8",
+            )
             copied.append(readme_path)
 
             manifest_path = package_dir / "manifest.json"
@@ -119,6 +128,7 @@ class DeliveryPackageService:
             manifest = {
                 "task_id": task.id,
                 "target": task.target,
+                "audience": "internal" if include_internal_evidence else "client",
                 "quality_status": quality.status,
                 "warnings": quality.warnings,
                 "files": files,
@@ -165,7 +175,7 @@ class DeliveryPackageService:
         return destination
 
     def _copy_subdomain_audit_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        source_dir = Path("data") / "subdomains" / f"task_{task_id}"
+        source_dir = self.config.data_path("subdomains", f"task_{task_id}")
         candidates = [
             (source_dir / "subdomain_audit.json", f"task_{task_id}_子域名DNS审计.json"),
         ]
@@ -176,10 +186,11 @@ class DeliveryPackageService:
         return copied
 
     def _copy_port_audit_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        source_dir = Path("data") / "nmap" / f"task_{task_id}"
+        source_dir = self.config.data_path("nmap", f"task_{task_id}")
         candidates = [
             (source_dir / "target_sources.json", f"task_{task_id}_端口目标来源.json"),
             (source_dir / "fofa_errors.json", f"task_{task_id}_FOFA失败记录.json"),
+            (source_dir / "port_anomaly_audit.json", f"task_{task_id}_端口异常响应审计.json"),
         ]
         copied = []
         for source, name in candidates:
@@ -188,7 +199,7 @@ class DeliveryPackageService:
         return copied
 
     def _copy_classification_audit_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        source_dir = Path("data") / "classify" / f"task_{task_id}"
+        source_dir = self.config.data_path("classify", f"task_{task_id}")
         service_rows = self.session.exec(select(ServiceAsset).where(ServiceAsset.scan_task_id == task_id)).all()
         if service_rows:
             AssetClassifierService(self.session, self.config)._write_service_classification_audit(task_id, service_rows)
@@ -203,9 +214,9 @@ class DeliveryPackageService:
         return copied
 
     def _copy_visual_audit_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        source_dir = Path("data") / "url_discovery" / f"task_{task_id}"
+        source_dir = self.config.data_path("url_discovery", f"task_{task_id}")
         candidates = [
-            (source_dir / "visual_analysis_audit.json", f"task_{task_id}_视觉识别审计.json"),
+            (source_dir / "visual_analysis_audit.json", f"task_{task_id}_Web页面识别审计.json"),
         ]
         copied = []
         for source, name in candidates:
@@ -214,7 +225,7 @@ class DeliveryPackageService:
         return copied
 
     def _copy_report_audit_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        source_dir = Path("data") / "report" / f"task_{task_id}"
+        source_dir = self.config.data_path("report", f"task_{task_id}")
         candidates = [
             (source_dir / "report_ai_audit.json", f"task_{task_id}_报告AI分析审计.json"),
         ]
@@ -224,7 +235,7 @@ class DeliveryPackageService:
                 copied.append(self._copy(source, package_dir / name))
         return copied
 
-    def _copy_screenshot_evidence(self, task_id: int, package_dir: Path) -> list[Path]:
+    def _copy_rendered_html_evidence(self, task_id: int, package_dir: Path) -> list[Path]:
         copied: list[Path] = []
         records: list[dict] = []
         source_to_package: dict[str, str] = {}
@@ -234,16 +245,16 @@ class DeliveryPackageService:
             evidence = row.evidence or {}
             visual = evidence.get("visual_analysis") if isinstance(evidence.get("visual_analysis"), dict) else {}
             candidates = [
-                visual.get("screenshot_path") if isinstance(visual, dict) else None,
-                evidence.get("visual_analysis_screenshot_path"),
+                visual.get("rendered_html_path") if isinstance(visual, dict) else None,
+                evidence.get("visual_analysis_rendered_html_path"),
             ]
-            source = self._first_existing_screenshot(candidates)
+            source = self._first_existing_evidence(candidates)
             if not source:
                 continue
             source_key = str(source.resolve())
             package_path = source_to_package.get(source_key)
             if not package_path:
-                package_path = self._screenshot_package_path(source, used_names)
+                package_path = self._rendered_html_package_path(source, used_names)
                 copied.append(self._copy(source, package_dir / package_path))
                 source_to_package[source_key] = package_path
             records.append(
@@ -259,21 +270,21 @@ class DeliveryPackageService:
                     "system_name": visual.get("system_name"),
                     "site_purpose": visual.get("site_purpose"),
                     "analysis_method": visual.get("analysis_method"),
-                    "source_path": str(source),
+                    "source_file_name": source.name,
                     "package_path": package_path,
                     "package_size": source.stat().st_size,
                     "package_sha256": self._sha256(source),
                 }
             )
         if records:
-            manifest_path = package_dir / f"task_{task_id}_截图证据清单.json"
+            manifest_path = package_dir / f"task_{task_id}_渲染HTML证据清单.json"
             manifest_path.write_text(
                 json.dumps(
                     {
                         "task_id": task_id,
-                        "screenshot_count": len(records),
+                        "rendered_html_count": len(records),
                         "file_count": len(source_to_package),
-                        "screenshots": records,
+                        "rendered_html": records,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -283,10 +294,7 @@ class DeliveryPackageService:
             copied.append(manifest_path)
         return copied
 
-    def _copy_screenshot_files(self, task_id: int, package_dir: Path) -> list[Path]:
-        return self._copy_screenshot_evidence(task_id, package_dir)
-
-    def _first_existing_screenshot(self, candidates: list[str | None]) -> Path | None:
+    def _first_existing_evidence(self, candidates: list[str | None]) -> Path | None:
         for value in candidates:
             if not value:
                 continue
@@ -295,19 +303,40 @@ class DeliveryPackageService:
                 return path
         return None
 
-    def _screenshot_package_path(self, source: Path, used_names: set[str]) -> str:
-        name = source.name or f"{hashlib.sha256(str(source).encode('utf-8')).hexdigest()[:12]}.png"
+    def _rendered_html_package_path(self, source: Path, used_names: set[str]) -> str:
+        name = source.name or f"{hashlib.sha256(str(source).encode('utf-8')).hexdigest()[:12]}.html"
         candidate = name
         index = 2
         while candidate in used_names:
             candidate = f"{source.stem}_{index}{source.suffix}"
             index += 1
         used_names.add(candidate)
-        return f"screenshots/{candidate}"
+        return f"rendered_html/{candidate}"
 
-    def _delivery_readme(self, task: ScanTask, quality_status: str, warnings: list[str], files: list[Path]) -> str:
+    def _client_quality_summary(self, task: ScanTask, quality) -> str:
         lines = [
-            "互联网数字资产暴露面测绘交付说明",
+            "互联网数字资产暴露面测绘质量摘要",
+            "",
+            f"任务编号：{task.id}",
+            f"测绘对象：{task.target}",
+            f"质量状态：{quality.status}",
+            "说明：本摘要用于说明本次交付物的完整性、覆盖情况和需复核事项。",
+        ]
+        if quality.warnings:
+            lines.extend(["", "需关注事项：", *[f"- {item}" for item in quality.warnings]])
+        return "\n".join(lines) + "\n"
+
+    def _delivery_readme(
+        self,
+        task: ScanTask,
+        quality_status: str,
+        warnings: list[str],
+        files: list[Path],
+        *,
+        internal: bool,
+    ) -> str:
+        lines = [
+            "互联网数字资产暴露面测绘交付说明" if not internal else "互联网数字资产暴露面测绘内部审计包说明",
             "",
             f"任务编号：{task.id}",
             f"测绘对象：{task.target}",
@@ -325,8 +354,8 @@ class DeliveryPackageService:
         descriptions = {
             "互联网资产暴露面测绘报告.docx": "Word 主报告，包含摘要、范围、统计、风险、复核计划和整改建议。",
             "资产汇总.xlsx": "资产汇总附件，包含单位覆盖、资产、DNS、端口、风险、审计文件说明等台账。",
-            "Web资产详情.xlsx": "Web 资产详情附件，包含重点 Web、截图证据、视觉识别、截图路径和复核清单。",
-            "quality_summary.txt": "质量门禁摘要。",
+            "Web资产详情.xlsx": "Web 资产详情附件，包含重点 Web、HTML 证据编号、页面识别和复核清单。",
+            "质量摘要.txt": "质量门禁摘要。",
             "待补充资产模板.yaml": "高/中优先级及部分覆盖单位的人工补充资产模板。",
             "复核工作单.yaml": "交付后复核工作单。",
             "补全计划.json": "下一轮补全计划的机器可读版本，包含质量状态、缺口和建议命令。",
@@ -335,32 +364,26 @@ class DeliveryPackageService:
             "端口目标来源.json": "端口扫描目标来源审计。",
             "HTTP探测审计.json": "HTTP 探测响应和失败审计。",
             "服务分类审计.json": "服务识别分类审计。",
-            "视觉识别审计.json": "截图 AI、复用和降级识别审计。",
+            "Web页面识别审计.json": "渲染 HTML AI、复用和降级识别审计。",
             "报告AI分析审计.json": "报告 AI 分块分析审计。",
-            "截图证据清单.json": "截图证据映射清单，记录原始截图路径、包内截图路径、截图哈希、URL、主机、端口和视觉识别结论。",
-            "screenshots": "原始网页截图证据文件，可与 Web 资产详情附件中的截图路径对应复核。",
+            "渲染HTML证据清单.json": "渲染 HTML 证据映射清单，记录原始路径、包内路径、哈希、URL、主机、端口和页面识别结论。",
+            "rendered_html": "浏览器加载完成后保存的网页 HTML 证据文件，可与 Web 资产详情附件中的 HTML 路径对应复核。",
         }
         for path in files:
             name = path.name
-            if "screenshots" in path.parts:
-                lines.append(f"- screenshots/{name}: {descriptions['screenshots']}")
+            if "rendered_html" in path.parts:
+                lines.append(f"- rendered_html/{name}: {descriptions['rendered_html']}")
                 continue
             description = next((text for marker, text in descriptions.items() if marker in name), "交付证据文件。")
             lines.append(f"- {name}: {description}")
-        lines.extend(
-            [
-                "",
-                "校验方式：",
-                f"- assetmap verify-package deliveries/task_{task.id}_{_safe_name(task.target)}.zip",
-                "",
-                "复测建议：",
-                f"- assetmap improve {task.id}",
-                f"- assetmap improve {task.id} --mode all --include-deliver --execute",
-                f"- assetmap quality-check {task.id}",
-                f"- assetmap review-workorder {task.id} --output data/review_workorder.task_{task.id}.yaml --force",
-                f"- assetmap import-review {task.id} --file data/review_workorder.task_{task.id}.yaml",
-            ]
-        )
+        lines.extend(["", "使用说明：", "- 请先阅读 Word 主报告，再按附件中的工作表查看资产、风险和复核结论。"])
+        if internal:
+            lines.extend(
+                [
+                    "- 本包包含原始证据、运行审计和复核工作单，仅限项目组在授权范围内使用。",
+                    "- 原始渲染 HTML 可能包含业务页面内容，不得作为客户常规分发材料。",
+                ]
+            )
         return "\n".join(lines) + "\n"
 
     def _file_record(self, path: Path, root: Path) -> dict:
@@ -450,17 +473,25 @@ class DeliveryPackageVerifier:
 
     def _check_required_delivery_files(self, manifest: dict, records: list[dict], failures: list[str]) -> None:
         task_id = manifest.get("task_id")
+        legacy_internal = "audience" not in manifest
         required_markers = [
             "互联网资产暴露面测绘报告",
             "资产汇总",
             "Web资产详情",
-            "quality_summary.txt",
-            "待补充资产模板.yaml",
-            "复核工作单.yaml",
-            "补全计划.json",
-            "补全计划.txt",
+            "quality_summary.txt" if legacy_internal else "质量摘要.txt",
             "交付说明.txt",
         ]
+        # Legacy packages do not carry an audience marker and are treated as
+        # internal so existing archives remain verifiable.
+        if manifest.get("audience", "internal") == "internal":
+            required_markers.extend(
+                [
+                    "待补充资产模板.yaml",
+                    "复核工作单.yaml",
+                    "补全计划.json",
+                    "补全计划.txt",
+                ]
+            )
         paths = [str(record.get("path") or "") for record in records]
         missing = [marker for marker in required_markers if not any(marker in path for path in paths)]
         if missing:
@@ -471,8 +502,8 @@ class DeliveryPackageVerifier:
         asset_name = self._find_record_path(records, "资产汇总")
         web_name = self._find_record_path(records, "Web资产详情")
         plan_name = self._find_record_path(records, "补全计划.json")
-        quality_name = self._find_record_path(records, "quality_summary.txt")
-        screenshot_manifest_name = self._find_record_path(records, "截图证据清单.json")
+        quality_name = self._find_record_path(records, "质量摘要.txt") or self._find_record_path(records, "quality_summary.txt")
+        html_manifest_name = self._find_record_path(records, "渲染HTML证据清单.json")
         service_audit_name = self._find_record_path(records, "服务分类审计.json")
         report_ai_audit_name = self._find_record_path(records, "报告AI分析审计.json")
 
@@ -486,12 +517,12 @@ class DeliveryPackageVerifier:
             self._check_improvement_plan_bytes(read_file(plan_name), failures)
         if quality_name:
             data = read_file(quality_name)
-            if data and "Quality:" not in data.decode("utf-8", errors="ignore"):
-                failures.append("quality_summary.txt 缺少 Quality 状态")
-        if screenshot_manifest_name:
-            self._check_screenshot_manifest_bytes(read_file(screenshot_manifest_name), records, failures)
-        elif any(str(record.get("path") or "").startswith("screenshots/") for record in records):
-            warnings.append("交付包包含截图文件但缺少截图证据清单")
+            if data and not any(marker in data.decode("utf-8", errors="ignore") for marker in ("质量状态：", "Quality:")):
+                failures.append("质量摘要缺少质量状态")
+        if html_manifest_name:
+            self._check_rendered_html_manifest_bytes(read_file(html_manifest_name), records, failures)
+        elif any(str(record.get("path") or "").startswith("rendered_html/") for record in records):
+            warnings.append("交付包包含渲染 HTML 文件但缺少证据清单")
         if service_audit_name:
             self._check_service_audit_bytes(read_file(service_audit_name), failures)
         if report_ai_audit_name:
@@ -548,18 +579,8 @@ class DeliveryPackageVerifier:
         self._require_sheets(workbook, EXPECTED_WEB_SHEETS, "Web资产详情附件", failures)
         if len(failures) > failure_count:
             return
-        sheet = workbook["截图证据"]
-        self._require_headers(sheet, {"缩略图", "截图文件", "截图状态"}, "Web资产详情附件/截图证据", failures)
-        headers = [cell.value for cell in sheet[1]]
-        if "截图状态" in headers:
-            status_column = headers.index("截图状态") + 1
-            rows_with_screenshot = sum(
-                1
-                for row_index in range(2, sheet.max_row + 1)
-                if sheet.cell(row=row_index, column=status_column).value == "有截图"
-            )
-            if rows_with_screenshot and not getattr(sheet, "_images", []):
-                warnings.append("Web资产详情附件截图证据存在截图路径但未嵌入缩略图")
+        sheet = workbook["HTML证据"]
+        self._require_headers(sheet, {"HTML文件", "HTML状态"}, "Web资产详情附件/HTML证据", failures)
 
     def _check_improvement_plan_bytes(self, data: bytes | None, failures: list[str]) -> None:
         if not data:
@@ -574,34 +595,34 @@ class DeliveryPackageVerifier:
         if not isinstance(payload.get("quality"), dict):
             failures.append("补全计划JSON缺少 quality 状态")
 
-    def _check_screenshot_manifest_bytes(self, data: bytes | None, records: list[dict], failures: list[str]) -> None:
+    def _check_rendered_html_manifest_bytes(self, data: bytes | None, records: list[dict], failures: list[str]) -> None:
         if not data:
             return
         try:
             payload = json.loads(data.decode("utf-8"))
         except Exception as exc:
-            failures.append(f"截图证据清单JSON无法解析: {str(exc)[:200]}")
+            failures.append(f"渲染HTML证据清单JSON无法解析: {str(exc)[:200]}")
             return
-        screenshots = payload.get("screenshots")
-        if not isinstance(screenshots, list):
-            failures.append("截图证据清单缺少 screenshots 列表")
+        html_files = payload.get("rendered_html")
+        if not isinstance(html_files, list):
+            failures.append("渲染HTML证据清单缺少 rendered_html 列表")
             return
         manifest_by_path = {str(record.get("path") or ""): record for record in records}
         manifest_paths = set(manifest_by_path)
         missing_paths = sorted(
             {
                 str(item.get("package_path") or "")
-                for item in screenshots
+                for item in html_files
                 if isinstance(item, dict)
-                and str(item.get("package_path") or "").startswith("screenshots/")
+                and str(item.get("package_path") or "").startswith("rendered_html/")
                 and str(item.get("package_path") or "") not in manifest_paths
             }
         )
         if missing_paths:
-            failures.append("截图证据清单引用了未打包截图: " + ", ".join(missing_paths))
+            failures.append("渲染HTML证据清单引用了未打包文件: " + ", ".join(missing_paths))
         hash_mismatches = []
         size_mismatches = []
-        for item in screenshots:
+        for item in html_files:
             if not isinstance(item, dict):
                 continue
             package_path = str(item.get("package_path") or "")
@@ -613,23 +634,22 @@ class DeliveryPackageVerifier:
             if item.get("package_size") not in {None, ""} and item.get("package_size") != record.get("size"):
                 size_mismatches.append(package_path)
         if hash_mismatches:
-            failures.append("截图证据清单哈希与 manifest 不一致: " + ", ".join(sorted(set(hash_mismatches))))
+            failures.append("渲染HTML证据清单哈希与 manifest 不一致: " + ", ".join(sorted(set(hash_mismatches))))
         if size_mismatches:
-            failures.append("截图证据清单大小与 manifest 不一致: " + ", ".join(sorted(set(size_mismatches))))
+            failures.append("渲染HTML证据清单大小与 manifest 不一致: " + ", ".join(sorted(set(size_mismatches))))
         incomplete_count = sum(
             1
-            for item in screenshots
+            for item in html_files
             if (
                 not isinstance(item, dict)
                 or not item.get("url")
                 or not item.get("package_path")
-                or not item.get("source_path")
                 or not item.get("package_sha256")
                 or item.get("package_size") in {None, ""}
             )
         )
         if incomplete_count:
-            failures.append(f"截图证据清单存在不完整记录: {incomplete_count}")
+            failures.append(f"渲染HTML证据清单存在不完整记录: {incomplete_count}")
 
     def _check_service_audit_bytes(self, data: bytes | None, failures: list[str]) -> None:
         if not data:

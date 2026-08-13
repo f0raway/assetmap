@@ -13,17 +13,18 @@ from assetmap.models import (
     CompanyAssetLink,
     CompanyEdge,
     DnsQueryStatus,
-    DnsRecord,
-    InternetAsset,
+        DnsRecord,
+        InternetAsset,
     NmapPort,
     NmapScanRun,
     NmapScanTask,
     ReportGenerationTask,
     ScanTask,
     ServiceAsset,
+    StageWorkUnit,
     SubdomainEnumerationTask,
     SubdomainRecord,
-    SubdomainToolRun,
+        SubdomainToolRun,
     UrlDiscoveryTask,
     WebEntrypoint,
 )
@@ -141,6 +142,13 @@ class PipelineStatusService:
                 SubdomainToolRun.status == "failed",
             )
         ).all()
+        dns_ai_failure = self.session.exec(
+            select(AiAnalysis).where(
+                AiAnalysis.scan_task_id == task_id,
+                AiAnalysis.analysis_type == "dns_inference",
+                AiAnalysis.status == "failed",
+            )
+        ).first()
         failed_dns_queries = self.session.exec(
             select(DnsQueryStatus).where(
                 DnsQueryStatus.scan_task_id == task_id,
@@ -151,15 +159,29 @@ class PipelineStatusService:
             select(NmapScanRun).where(
                 NmapScanRun.scan_task_id == task_id,
                 NmapScanRun.status == "failed",
+                # A legacy aggregate batch record has no recoverable target
+                # completion information.  It remains as audit evidence but
+                # must not keep a migrated per-IP stage permanently failed.
+                NmapScanRun.target_ip != "__batch__",
+            )
+        ).all()
+        failed_fofa_lookups = self.session.exec(
+            select(StageWorkUnit).where(
+                StageWorkUnit.scan_task_id == task_id,
+                StageWorkUnit.stage == "port-scan",
+                StageWorkUnit.unit_type == "fofa_ip_lookup",
+                StageWorkUnit.status.in_(["failed", "interrupted"]),
             )
         ).all()
         subdomain_status = self._status_with_partial_failures(
             self._task_status(subdomain_task, counts["subdomains"] or counts["dns"]),
             len(subdomain_failed_runs) + len(failed_dns_queries),
         )
+        if dns_ai_failure:
+            subdomain_status = "completed_with_gaps"
         nmap_status = self._status_with_partial_failures(
             self._task_status(nmap_task, counts["open_ports"]),
-            len(failed_nmap_runs),
+            len(failed_nmap_runs) + len(failed_fofa_lookups),
         )
         report_status, report_artifacts = self._report_status(report_task, counts["report_sections"])
         return [
@@ -167,9 +189,14 @@ class PipelineStatusService:
             (
                 "subdomains",
                 subdomain_status,
-                f"subdomains={counts['subdomains']}, dns_records={counts['dns']}, failed_items={len(subdomain_failed_runs) + len(failed_dns_queries)}",
+                f"subdomains={counts['subdomains']}, dns_records={counts['dns']}, failed_items={len(subdomain_failed_runs) + len(failed_dns_queries)}, ai_review={'failed' if dns_ai_failure else 'ok'}",
             ),
-            ("port-scan", nmap_status, f"open_ports={counts['open_ports']}, failed_runs={len(failed_nmap_runs)}"),
+            (
+                "port-scan",
+                nmap_status,
+                f"open_ports={counts['open_ports']}, failed_runs={len(failed_nmap_runs)}, "
+                f"failed_fofa_lookups={len(failed_fofa_lookups)}",
+            ),
             ("classify", self._task_status(classify_task, counts["service_assets"]), f"services={counts['service_assets']}, web={counts['web_assets']}"),
             ("url-discover", self._task_status(url_task, counts["web_entrypoints"]), f"entrypoints={counts['web_entrypoints']}, visual_ok={counts['visual_done']}, visual_error={counts['visual_failed']}"),
             ("report", report_status, f"ai_sections={counts['report_sections']}, artifacts={report_artifacts}"),

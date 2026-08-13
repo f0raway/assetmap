@@ -13,22 +13,14 @@ from assetmap.services.mapping.subdomain import SubdomainService
 from assetmap.services.mapping.nmap_scan import NmapScanService
 from assetmap.services.identification.asset_classifier import AssetClassifierService
 from assetmap.services.identification.url_discovery import UrlDiscoveryService
-from assetmap.services.delivery.report import ReportService
 from assetmap.services.delivery.quality import DeliveryQualityService
 from assetmap.services.delivery.package import DeliveryPackageService, DeliveryPackageVerifier
-from assetmap.services.acquisition.manual_import import ManualAssetImportService
-from assetmap.services.operations.status import PipelineStatusService
 from assetmap.services.runtime.environment import EnvironmentCheckService
+from assetmap.stages import pipeline as stage_pipeline
 
 from .common import (
     _exit_interrupted,
     _warn_environment,
-    _selected_pipeline_stages,
-    _stage_status_map,
-    _should_run_stage,
-    _has_visual_gaps,
-    _csv_values,
-    PIPELINE_STAGES,
 )
 
 
@@ -41,7 +33,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             service = DiscoveryService(session, config, progress=typer.echo)
@@ -69,7 +61,7 @@ def register(app: typer.Typer) -> None:
     ):
         """一键执行：企业采集 -> 子域名/DNS -> 端口 -> 服务/URL -> 报告 -> 打包校验。"""
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             _run_one_click_scan(
@@ -99,7 +91,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             _warn_environment(config, include_nmap=False)
@@ -116,24 +108,16 @@ def register(app: typer.Typer) -> None:
     def port_scan_command(
         task_id: int,
         rerun: bool = typer.Option(False, "--rerun"),
-        sources: str | None = typer.Option(None, "--sources", help="临时覆盖端口发现来源，例如 nmap、fofa 或 nmap,fofa。"),
-        target_sources: str | None = typer.Option(None, "--target-sources", help="临时覆盖端口目标来源，例如 ai,manual,dns_public。"),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        override_sources = _csv_values(sources)
-        override_target_sources = _csv_values(target_sources)
-        if override_sources is not None:
-            config.port_scan.sources_enabled = override_sources
-        if override_target_sources is not None:
-            config.port_scan.target_sources_enabled = override_target_sources
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             _warn_environment(
                 config,
                 include_subdomain_tools=False,
-                include_nmap="nmap" in {source.lower().strip() for source in config.port_scan.sources_enabled},
+                include_nmap=True,
             )
             service = NmapScanService(session, config, progress=typer.echo)
             nmap_task_id = service.run(task_id, rerun=rerun)
@@ -150,10 +134,10 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
-            _warn_environment(config, include_subdomain_tools=False)
+            _warn_environment(config, include_subdomain_tools=False, include_httpx=True)
             service = AssetClassifierService(session, config, progress=typer.echo)
             classify_task_id = service.run(task_id, rerun=rerun)
             typer.echo(f"Classification task {classify_task_id} completed for scan task {task_id}.")
@@ -170,7 +154,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             typer.echo(
@@ -203,15 +187,15 @@ def register(app: typer.Typer) -> None:
         rerun_dns: bool = typer.Option(False, "--rerun-dns", help="强制重跑子域名阶段的 DNS 解析，并刷新后续阶段。"),
         rerun_ports: bool = typer.Option(False, "--rerun-ports", help="强制重跑端口发现，并刷新后续阶段。"),
         rerun_classify: bool = typer.Option(False, "--rerun-classify", help="强制重跑服务识别，并刷新 URL 识别和报告。"),
-        rerun_urls: bool = typer.Option(False, "--rerun-urls", help="强制重跑 URL 入口和视觉识别，并刷新报告。"),
+        rerun_urls: bool = typer.Option(False, "--rerun-urls", help="强制重跑 URL 入口和页面识别，并刷新报告。"),
         rerun_ai: bool = typer.Option(False, "--rerun-ai", help="强制重算报告中的 AI 分块分析。"),
         no_ai: bool = typer.Option(False, "--no-ai", help="子域名/DNS 阶段不调用 AI 推理。"),
-        retry_failed_url: bool = typer.Option(True, "--retry-failed/--no-retry-failed", help="URL 阶段默认只补跑失败或缺失视觉识别的页面。"),
+        retry_failed_url: bool = typer.Option(True, "--retry-failed/--no-retry-failed", help="URL 阶段默认只补跑失败或缺失页面识别的入口。"),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="配置文件路径。"),
     ):
         """按流水线状态自动续跑资产测绘流程。"""
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             _run_pipeline(
@@ -237,6 +221,57 @@ def register(app: typer.Typer) -> None:
         finally:
             session.close()
 
+    @app.command("pipeline")
+    def unified_pipeline_command(
+        target: str | None = typer.Argument(None, help="新建或续跑的目标企业名称。"),
+        task_id: int | None = typer.Option(None, "--task-id", help="已有任务 ID。"),
+        fresh: bool = typer.Option(False, "--fresh", help="重新执行企业发现，并刷新后续阶段。"),
+        manual_file: Path | None = typer.Option(None, "--manual-file", "-m", help="导入人工补充资产后继续。"),
+        from_stage: str = typer.Option("enterprise-discovery", "--from-stage"),
+        to_stage: str = typer.Option("report-generation", "--to-stage"),
+        rerun: bool = typer.Option(False, "--rerun", help="重跑所选范围内的已完成阶段。"),
+        rerun_tools: bool = typer.Option(False, "--rerun-tools"),
+        rerun_dns: bool = typer.Option(False, "--rerun-dns"),
+        rerun_ports: bool = typer.Option(False, "--rerun-ports"),
+        rerun_classify: bool = typer.Option(False, "--rerun-classify"),
+        rerun_urls: bool = typer.Option(False, "--rerun-urls"),
+        rerun_ai: bool = typer.Option(False, "--rerun-ai"),
+        no_ai: bool = typer.Option(False, "--no-ai", help="域名阶段跳过 AI 源站判断。"),
+        retry_failed: bool = typer.Option(False, "--retry-failed", help="仅重试实际失败的页面识别。"),
+        output_dir: Path = typer.Option(Path("reports"), "--output-dir"),
+        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
+    ):
+        """用同一条生产路径串联全部独立阶段；各阶段仍可单独执行。"""
+        config = load_config(config_path)
+        try:
+            result = stage_pipeline.run(
+                config,
+                target=target,
+                task_id=task_id,
+                fresh=fresh,
+                manual_file=manual_file,
+                from_stage=from_stage,
+                to_stage=to_stage,
+                rerun=rerun,
+                rerun_tools=rerun_tools,
+                rerun_dns=rerun_dns,
+                rerun_ports=rerun_ports,
+                rerun_classify=rerun_classify,
+                rerun_urls=rerun_urls,
+                rerun_ai=rerun_ai,
+                skip_ai=no_ai,
+                retry_failed=retry_failed,
+                output_dir=output_dir,
+                progress=typer.echo,
+            )
+            typer.echo(
+                f"[pipeline] 完成：task_id={result.task_id}，"
+                f"执行={','.join(result.executed) or '无'}，"
+                f"跳过={','.join(result.skipped) or '无'}。"
+            )
+        except KeyboardInterrupt:
+            _exit_interrupted()
+
 
 def _run_one_click_scan(
     session,
@@ -254,10 +289,15 @@ def _run_one_click_scan(
 ) -> int:
     _require_full_scan_environment(config, progress)
     progress("[scan] 1/3 discover enterprise tree and filing assets")
-    result = DiscoveryService(session, config, progress=progress).run(
-        target,
-        resume_task_id=resume_task,
+    # Keep the one-click command on the same public stage boundary as
+    # ``assetmap pipeline`` and ``assetmap run``.  The surrounding CLI session
+    # remains responsible only for the optional manual checkpoint and package.
+    result = stage_pipeline.enterprise_discovery.run(
+        config,
+        target=target,
+        task_id=resume_task,
         fresh=refresh,
+        progress=progress,
     )
     progress(
         f"[scan] discovered task={result.task_id}, companies={result.company_count}, "
@@ -353,71 +393,25 @@ def _run_pipeline(
     retry_failed_url: bool = True,
     force_changed: bool = False,
 ) -> None:
-    selected = _selected_pipeline_stages(from_stage, to_stage)
-    progress(f"[run] task={task_id}, stages={','.join(selected)}")
-    if manual_file:
-        progress(f"[run] import manual assets -> {manual_file}")
-        ManualAssetImportService(session, progress=progress).run(task_id, manual_file)
-    changed = bool(manual_file) or force_changed
-    stage_status = _stage_status_map(session, task_id)
-    if "subdomains" in selected and _should_run_stage(stage_status, "subdomains", rerun or rerun_subdomain_tools or rerun_dns or changed):
-        _warn_environment(config, include_nmap=False)
-        SubdomainService(session, config, progress=progress).run(
-            task_id,
-            run_ai=not no_ai,
-            rerun_tools=rerun or rerun_subdomain_tools,
-            rerun_dns=rerun or rerun_subdomain_tools or rerun_dns,
-        )
-        changed = True
-    else:
-        progress("[run] skip subdomains")
-    stage_status = _stage_status_map(session, task_id)
-    if "port-scan" in selected and _should_run_stage(stage_status, "port-scan", rerun or rerun_ports or changed):
-        _warn_environment(
-            config,
-            include_subdomain_tools=False,
-            include_nmap="nmap" in {source.lower().strip() for source in config.port_scan.sources_enabled},
-        )
-        NmapScanService(session, config, progress=progress).run(task_id, rerun=rerun or rerun_ports or changed)
-        changed = True
-    else:
-        progress("[run] skip port-scan")
-    stage_status = _stage_status_map(session, task_id)
-    if "classify" in selected and _should_run_stage(stage_status, "classify", rerun or rerun_classify or changed):
-        _warn_environment(config, include_subdomain_tools=False)
-        AssetClassifierService(session, config, progress=progress).run(task_id, rerun=rerun or rerun_classify or changed)
-        changed = True
-    else:
-        progress("[run] skip classify")
-    stage_status = _stage_status_map(session, task_id)
-    run_url = _should_run_stage(stage_status, "url-discover", rerun or rerun_urls or changed)
-    if not run_url and retry_failed_url:
-        run_url = _has_visual_gaps(session, task_id)
-    if "url-discover" in selected and run_url:
-        progress(
-            "[url] purpose: seed URL entrypoints from classified web services, "
-            "then screenshot pages and use AI to identify system names and site purpose."
-        )
-        UrlDiscoveryService(session, config, progress=progress).run(
-            task_id,
-            rerun=rerun or rerun_urls or changed,
-            retry_failed=retry_failed_url and not rerun,
-        )
-        changed = True
-    else:
-        progress("[run] skip url-discover")
-    stage_status = _stage_status_map(session, task_id)
-    if "report" in selected and _should_run_stage(stage_status, "report", rerun or rerun_ai or changed):
-        result = ReportService(session, config, progress=progress).run(task_id, rerun_ai=rerun or rerun_ai or changed)
-        progress(f"Report generated: {result.report_path}")
-        progress(f"Attachment generated: {result.asset_workbook_path}")
-        progress(f"Attachment generated: {result.web_workbook_path}")
-    else:
-        progress("[run] skip report")
-    progress("[run] final status")
-    status = PipelineStatusService(session).get(task_id)
-    for line in status.lines:
-        progress(line)
+    """Compatibility wrapper: normal CLI resume uses the standalone stages."""
+    stage_pipeline.run(
+        config,
+        task_id=task_id,
+        manual_file=manual_file,
+        from_stage=from_stage,
+        to_stage=to_stage,
+        rerun=rerun,
+        rerun_tools=rerun_subdomain_tools,
+        rerun_dns=rerun_dns,
+        rerun_ports=rerun_ports,
+        rerun_classify=rerun_classify,
+        rerun_urls=rerun_urls,
+        rerun_ai=rerun_ai,
+        skip_ai=no_ai,
+        retry_failed=retry_failed_url,
+        force_changed=force_changed,
+        progress=progress,
+    )
 
 
 def _prompt_manual_asset_import(

@@ -176,6 +176,24 @@ class DnsRecord(SQLModel, table=True):
     observed_at: datetime = Field(default_factory=utcnow, nullable=False)
 
 
+class OriginIpCandidate(SQLModel, table=True):
+    """Auditable origin-IP decision produced by the domain mapping stage."""
+
+    __tablename__ = "origin_ip_candidates"
+    __table_args__ = (UniqueConstraint("scan_task_id", "ip"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_task_id: int = Field(index=True, foreign_key="scan_tasks.id")
+    ip: str = Field(index=True)
+    decision: str = Field(default="pending_ai", index=True)
+    confidence: str = Field(default="low", index=True)
+    reason_codes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    associated_fqdns: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    evidence: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    source: str = Field(default="dns", index=True)
+    updated_at: datetime = Field(default_factory=utcnow, nullable=False)
+
+
 class AiAnalysis(SQLModel, table=True):
     __tablename__ = "ai_analyses"
     __table_args__ = (UniqueConstraint("scan_task_id", "analysis_type"),)
@@ -222,6 +240,32 @@ class NmapScanRun(SQLModel, table=True):
     stdout: Optional[str] = Field(default=None)
     stderr: Optional[str] = Field(default=None)
     error_message: Optional[str] = Field(default=None)
+
+
+class StageWorkUnit(SQLModel, table=True):
+    """Durable state for the smallest resumable piece of a pipeline stage.
+
+    A stage-level status only says whether the overall stage ended.  This model
+    records the individual external request or tool job that can safely be
+    skipped after an interruption.
+    """
+
+    __tablename__ = "stage_work_units"
+    __table_args__ = (UniqueConstraint("scan_task_id", "stage", "unit_type", "unit_key"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_task_id: int = Field(index=True, foreign_key="scan_tasks.id")
+    stage: str = Field(index=True)
+    unit_type: str = Field(index=True)
+    unit_key: str = Field(index=True)
+    input_fingerprint: str = Field(index=True)
+    status: str = Field(default="pending", index=True)
+    attempts: int = Field(default=0)
+    started_at: Optional[datetime] = Field(default=None)
+    finished_at: Optional[datetime] = Field(default=None)
+    output_path: Optional[str] = Field(default=None)
+    error_message: Optional[str] = Field(default=None)
+    details: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
 
 class NmapPort(SQLModel, table=True):

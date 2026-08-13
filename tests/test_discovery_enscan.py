@@ -8,6 +8,59 @@ from assetmap.models import Company, CompanyAssetLink, CompanyEdge, InternetAsse
 from assetmap.services.acquisition.discovery import DiscoveryService, _asset_payload
 
 
+def test_enterprise_discovery_calls_bundled_collector_in_process(tmp_path: Path, monkeypatch):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    config.enterprise_discovery.tycid = "tycid"
+    config.enterprise_discovery.auth_token = "token"
+    config.enterprise_discovery.control_threshold = 0.47
+    config.enterprise_discovery.max_depth = 4
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    task = ScanTask(target="Root Co", status="running")
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    captured = {}
+
+    def fake_run_crawl(client_options, crawl_options, run_options, *, progress):
+        captured["client_options"] = client_options
+        captured["crawl_options"] = crawl_options
+        captured["run_options"] = run_options
+        progress("company_started", {"name": "Root Co", "depth": 0})
+        from assetmap.collectors.tyc_invest_crawler import CrawlResult
+
+        return CrawlResult(source="Root Co", generated_at="2026-01-01T00:00:00+00:00", criteria={}, crawler_state={})
+
+    monkeypatch.setattr("assetmap.services.acquisition.discovery.run_crawl", fake_run_crawl)
+
+    payload = DiscoveryService(session, config)._run_collector(task.id, "Root Co")
+
+    assert payload["source"] == "Root Co"
+    assert captured["client_options"].tycid == "tycid"
+    assert captured["client_options"].auth_token == "token"
+    assert captured["crawl_options"].threshold == 47.0
+    assert captured["crawl_options"].max_depth == 4
+    assert captured["run_options"].output.name == f"task_{task.id}.json"
+
+
+def test_enterprise_discovery_reports_missing_new_config_fields(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    task = ScanTask(target="Root Co", status="running")
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+
+    try:
+        DiscoveryService(session, config)._run_collector(task.id, "Root Co")
+    except ValueError as exc:
+        assert "enterprise_discovery.tycid" in str(exc)
+        assert "enterprise_discovery.auth_token" in str(exc)
+    else:
+        raise AssertionError("Expected a credential configuration error")
+
+
 def test_persist_tyc_payload(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)

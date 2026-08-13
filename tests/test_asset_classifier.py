@@ -34,6 +34,55 @@ def test_web_asset_prefers_final_url(tmp_path: Path):
     assert row.representative_url == "https://www.example.cn/login"
 
 
+def test_httpx_json_result_is_saved_as_a_web_probe(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    output = tmp_path / "httpx.jsonl"
+    url = "https://portal.example.cn:443/"
+    output.write_text(
+        json.dumps({"input": url, "url": "https://portal.example.cn/login", "status_code": 200,
+                    "title": "统一门户", "webserver": "nginx", "content_type": "text/html",
+                    "content_length": 1234, "tech": ["Vue"], "hashes": {"sha256": "abc"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    saved = AssetClassifierService(session, config)._save_httpx_results(
+        1, output, {url: ("8.8.8.8", 443, "https", "portal.example.cn")}
+    )
+
+    result = session.exec(select(WebProbeResult)).one()
+    assert saved == 1
+    assert result.status == "responded"
+    assert result.final_url == "https://portal.example.cn/login"
+    assert result.tech_stack == ["Vue"]
+    assert result.raw_headers["probe_source"] == "projectdiscovery_httpx"
+
+
+def test_legacy_python_probe_checkpoint_is_replaced(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(
+        WebProbeResult(
+            scan_task_id=1,
+            target_ip="8.8.8.8",
+            port=80,
+            scheme="http",
+            host="8.8.8.8",
+            url="http://8.8.8.8:80/",
+            status="responded",
+            raw_headers={"server": "legacy"},
+        )
+    )
+    session.commit()
+
+    checkpoint = AssetClassifierService(session, config)._httpx_checkpoint(1, "8.8.8.8", 80, "http", "8.8.8.8")
+
+    assert checkpoint is None
+    assert session.exec(select(WebProbeResult)).all() == []
+
+
 def test_classifier_logs_probe_and_service_summary(tmp_path: Path):
     old_cwd = Path.cwd()
     import os
@@ -92,7 +141,6 @@ def test_classifier_logs_probe_and_service_summary(tmp_path: Path):
 
 def test_fofa_host_is_used_as_web_probe_candidate(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.web_probe.max_workers = 1
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     port = NmapPort(
@@ -105,19 +153,15 @@ def test_fofa_host_is_used_as_web_probe_candidate(tmp_path: Path):
     )
     session.add(port)
     session.commit()
-    captured = []
     service = AssetClassifierService(session, config)
-    service._probe_one = lambda scan_task_id, target_ip, port, scheme, host: captured.append((target_ip, port, scheme, host))  # type: ignore[method-assign]
+    hosts = service._probe_hosts(port, {}, service._fofa_hosts_by_port(1))
 
-    service._probe_web(1, [port], rerun=True)
-
-    assert ("8.8.8.8", 443, "https", "portal.example.cn") in captured
+    assert "portal.example.cn" in hosts
     assert service._fofa_hosts_by_port(1) == {("8.8.8.8", 443): ["portal.example.cn"]}
 
 
-def test_probe_hosts_advances_to_unprobed_domain_batch(tmp_path: Path):
+def test_probe_hosts_returns_all_unprobed_domains_without_a_batch_limit(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.web_probe.max_domains_per_ip = 1
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     port = NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=80, state="open")
@@ -144,13 +188,114 @@ def test_probe_hosts_advances_to_unprobed_domain_batch(tmp_path: Path):
     session.commit()
 
     hosts = AssetClassifierService(session, config)._probe_hosts(
-        1,
         port,
         {"8.8.8.8": ["a.example.cn", "b.example.cn"]},
         {},
     )
 
-    assert hosts == ["a.example.cn", "b.example.cn"]
+    assert hosts == ["8.8.8.8", "a.example.cn", "b.example.cn"]
+
+
+def test_web_probe_runs_httpx_primary_then_fallback_batches(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    port = NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=80, state="open")
+    captured = []
+    service = AssetClassifierService(session, config)
+    service._run_httpx_batch = lambda task_id, phase, jobs: captured.append((phase, jobs))  # type: ignore[method-assign]
+
+    service._probe_web(
+        1,
+        [port],
+        rerun=True,
+    )
+
+    assert captured == [
+        ("primary", [("8.8.8.8", 80, "http", "8.8.8.8")]),
+        ("fallback", [("8.8.8.8", 80, "https", "8.8.8.8")]),
+    ]
+
+
+def test_standard_web_port_skips_fallback_after_primary_response(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    captured = []
+
+    def responded(task_id, phase, jobs):
+        captured.append((phase, jobs))
+        if phase == "primary":
+            for target_ip, port, scheme, host in jobs:
+                service._save_httpx_probe(task_id, (target_ip, port, scheme, host), {"status_code": 200})
+
+    service._run_httpx_batch = responded  # type: ignore[method-assign]
+    service._probe_web(
+        1,
+        [
+            NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=80, state="open"),
+            NmapPort(scan_task_id=1, target_ip="1.1.1.1", protocol="tcp", port=443, state="open"),
+        ],
+        rerun=True,
+    )
+
+    assert captured == [
+        ("primary", [("8.8.8.8", 80, "http", "8.8.8.8"), ("1.1.1.1", 443, "https", "1.1.1.1")])
+    ]
+
+
+def test_http_400_tls_mismatch_triggers_https_fallback(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    captured = []
+
+    def tls_mismatch(task_id, phase, jobs):
+        captured.append((phase, jobs))
+        if phase == "primary":
+            for job in jobs:
+                service._save_httpx_probe(
+                    task_id,
+                    job,
+                    {
+                        "status_code": 400,
+                        "title": "400 The plain HTTP request was sent to HTTPS port",
+                    },
+                )
+
+    service._run_httpx_batch = tls_mismatch  # type: ignore[method-assign]
+    service._probe_web(
+        1,
+        [NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=21082, state="open", service="https")],
+        rerun=True,
+    )
+
+    assert captured == [
+        ("primary", [("8.8.8.8", 21082, "http", "8.8.8.8")]),
+        ("fallback", [("8.8.8.8", 21082, "https", "8.8.8.8")]),
+    ]
+    primary = session.exec(select(WebProbeResult).where(WebProbeResult.scheme == "http")).one()
+    assert primary.status == "protocol_mismatch"
+
+
+def test_protocol_mismatch_is_not_classified_as_a_web_service(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = AssetClassifierService(session, config)
+    port = NmapPort(scan_task_id=1, target_ip="8.8.8.8", protocol="tcp", port=21082, state="open", service="https")
+    service._save_httpx_probe(
+        1,
+        ("8.8.8.8", 21082, "http", "8.8.8.8"),
+        {"status_code": 400, "title": "The plain HTTP request was sent to HTTPS port"},
+    )
+
+    service._classify(1, [port])
+
+    asset = session.exec(select(ServiceAsset)).one()
+    assert asset.asset_kind == "non_web"
 
 
 def test_obvious_non_web_ports_are_not_web_probed(tmp_path: Path):
@@ -166,66 +311,7 @@ def test_obvious_non_web_ports_are_not_web_probed(tmp_path: Path):
         state="open",
         service="ssh",
     )
-    captured = []
-    service._probe_one = lambda *args: captured.append(args)  # type: ignore[method-assign]
-
-    service._probe_web(1, [port], rerun=True)
-
-    assert captured == []
-
-
-def test_service_detection_reuses_deep_nmap_evidence_and_checks_fofa_only_port(tmp_path: Path):
-    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    engine = create_db_and_engine(config.database.url)
-    session = get_session(engine)
-    service = AssetClassifierService(session, config)
-    nmap_port = NmapPort(
-        scan_task_id=1,
-        target_ip="8.8.8.8",
-        protocol="tcp",
-        port=443,
-        state="open",
-        service="https",
-        raw_payload={"source": "nmap", "service": {"name": "https"}},
-    )
-    fofa_port = NmapPort(
-        scan_task_id=1,
-        target_ip="8.8.4.4",
-        protocol="tcp",
-        port=8443,
-        state="open",
-        raw_payload={"source": "fofa"},
-    )
-    detected: list[tuple[str, list[int]]] = []
-    service._detect_host_services = (  # type: ignore[method-assign]
-        lambda scan_task_id, target_ip, ports: detected.append((target_ip, [port.port for port in ports]))
-    )
-
-    service._detect_services(1, [nmap_port, fofa_port])
-
-    assert detected == [("8.8.4.4", [8443])]
-
-
-def test_service_detection_falls_back_when_custom_nmap_command_has_no_version_detect(tmp_path: Path):
-    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.tools.nmap_command = "{binary} -Pn -p- -iL {targets_file} -oX {xml_output} -oN {normal_output}"
-    engine = create_db_and_engine(config.database.url)
-    session = get_session(engine)
-    service = AssetClassifierService(session, config)
-    port = NmapPort(
-        scan_task_id=1,
-        target_ip="8.8.8.8",
-        protocol="tcp",
-        port=443,
-        state="open",
-        raw_payload={"source": "nmap"},
-    )
-    detected: list[int] = []
-    service._detect_host_services = lambda scan_task_id, target_ip, ports: detected.extend(port.port for port in ports)  # type: ignore[method-assign]
-
-    service._detect_services(1, [port])
-
-    assert detected == [443]
+    assert service._should_probe_web(port) is False
 
 
 def test_nonstandard_port_uses_fofa_host_without_dns_fanout(tmp_path: Path):
@@ -245,14 +331,9 @@ def test_nonstandard_port_uses_fofa_host_without_dns_fanout(tmp_path: Path):
     for host in ("a.example.cn", "b.example.cn", "c.example.cn"):
         session.add(DnsRecord(scan_task_id=1, fqdn=host, root_domain="example.cn", record_type="A", value="8.8.8.8"))
     session.commit()
-    captured = []
     service = AssetClassifierService(session, config)
-    service._probe_one = lambda scan_task_id, target_ip, port, scheme, host: captured.append((scheme, host))  # type: ignore[method-assign]
-
-    service._probe_web(1, [port], rerun=True)
-
-    hosts = {host for _, host in captured}
-    assert hosts == {"8.8.8.8", "portal.example.cn"}
+    hosts = service._probe_hosts(port, service._domains_by_ip(1), service._fofa_hosts_by_port(1))
+    assert set(hosts) == {"8.8.8.8", "portal.example.cn"}
 
 
 def test_failed_active_probe_keeps_fofa_passive_web_asset(tmp_path: Path):

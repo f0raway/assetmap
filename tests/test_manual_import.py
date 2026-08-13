@@ -6,7 +6,7 @@ from sqlmodel import select
 
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.models import AiAnalysis, Company, CompanyAssetLink, CompanyEdge, DnsRecord, InternetAsset, NmapPort, NmapScanRun, ScanTask, SourceRawRecord, SubdomainRecord, WebEntrypoint
+from assetmap.models import AiAnalysis, Company, CompanyAssetLink, CompanyEdge, DnsRecord, InternetAsset, NmapPort, NmapScanRun, OriginIpCandidate, ScanTask, SourceRawRecord, SubdomainRecord, WebEntrypoint
 from assetmap.services.acquisition.manual_import import ManualAssetImportService, write_manual_asset_template
 from assetmap.services.operations.maintenance import MaintenanceService
 from assetmap.services.mapping.fofa import FofaClient, FofaPort
@@ -97,9 +97,8 @@ emails:
     assert mini.normalized_identifier == "苏ICP备202300001号-1X"
     assert NmapScanService(session, config)._targets(task.id) == ["8.8.8.8"]
     assert NmapScanService(session, config)._targets_by_source(task.id) == {
-        "ai": [],
-        "manual": ["8.8.8.8"],
-        "dns_public": [],
+        "origin_confirmed": [],
+        "manual_confirmed": ["8.8.8.8"],
     }
 
 
@@ -759,7 +758,7 @@ def test_fofa_validation_parse_keeps_existing_nmap_only_ports(tmp_path: Path):
     assert rows[8443].raw_payload["nmap"]["source"] == "nmap"
 
 
-def test_port_targets_include_dns_public_records(tmp_path: Path):
+def test_port_targets_only_include_confirmed_or_manual_records(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
@@ -770,8 +769,8 @@ def test_port_targets_include_dns_public_records(tmp_path: Path):
 
     by_source = NmapScanService(session, config)._targets_by_source(1)
 
-    assert by_source["dns_public"] == ["8.8.4.4"]
-    assert by_source["manual"] == ["8.8.8.8"]
+    assert by_source["origin_confirmed"] == []
+    assert by_source["manual_confirmed"] == ["8.8.8.8"]
 
 
 def test_port_targets_write_source_manifest(tmp_path: Path, monkeypatch):
@@ -779,15 +778,7 @@ def test_port_targets_write_source_manifest(tmp_path: Path, monkeypatch):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
-    session.add(
-        AiAnalysis(
-            scan_task_id=1,
-            analysis_type="dns_inference",
-            status="completed",
-            summary="NMAP_TARGET_IPS\n8.8.8.8\nEND_NMAP_TARGET_IPS",
-        )
-    )
-    session.add(DnsRecord(scan_task_id=1, fqdn="www.example.cn", root_domain="example.cn", record_type="A", value="8.8.8.8"))
+    session.add(OriginIpCandidate(scan_task_id=1, ip="8.8.8.8", decision="include", confidence="high"))
     session.add(DnsRecord(scan_task_id=1, fqdn="manual", root_domain="manual", record_type="A", value="1.1.1.1", raw_payload={"kind": "manual_ip"}))
     session.commit()
     logs: list[str] = []
@@ -797,8 +788,8 @@ def test_port_targets_write_source_manifest(tmp_path: Path, monkeypatch):
     manifest = tmp_path / "data" / "nmap" / "task_1" / "target_sources.json"
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert targets == ["8.8.8.8", "1.1.1.1"]
-    assert payload["source_counts"] == {"ai": 1, "manual": 1, "dns_public": 1}
-    assert payload["sources_by_ip"]["8.8.8.8"] == ["ai", "dns_public"]
+    assert payload["source_counts"] == {"origin_confirmed": 1, "manual_confirmed": 1}
+    assert payload["sources_by_ip"]["8.8.8.8"] == ["origin_confirmed"]
     assert any("target source manifest" in line for line in logs)
 
 
@@ -818,7 +809,7 @@ def test_fofa_failures_are_logged_without_breaking_nmap_source(tmp_path: Path, m
 
     monkeypatch.setattr("assetmap.services.mapping.nmap_scan.FofaClient", BrokenFofaClient)
 
-    NmapScanService(session, config, progress=logs.append)._run_fofa(1, ["8.8.8.8"], required=False)
+    NmapScanService(session, config, progress=logs.append)._run_fofa(1, ["8.8.8.8"])
 
     payload = json.loads((tmp_path / "data" / "nmap" / "task_1" / "fofa_errors.json").read_text(encoding="utf-8"))
     assert payload["error_count"] == 1
@@ -826,7 +817,7 @@ def test_fofa_failures_are_logged_without_breaking_nmap_source(tmp_path: Path, m
     assert any("[fofa] failures: 1/1" in line for line in logs)
 
 
-def test_fofa_only_mode_fails_when_all_passive_lookups_fail(tmp_path: Path, monkeypatch):
+def test_fofa_failures_do_not_abort_port_pipeline(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
@@ -842,40 +833,20 @@ def test_fofa_only_mode_fails_when_all_passive_lookups_fail(tmp_path: Path, monk
     monkeypatch.setattr("assetmap.services.mapping.nmap_scan.FofaClient", BrokenFofaClient)
 
     service = NmapScanService(session, config)
-    try:
-        service._run_fofa(1, ["8.8.8.8"], required=True)
-    except RuntimeError as exc:
-        assert "FOFA passive lookup failed for all targets" in str(exc)
-    else:
-        raise AssertionError("expected FOFA-only failure")
+    service._run_fofa(1, ["8.8.8.8"])
 
 
-def test_port_targets_only_use_dns_inference_ai_analysis(tmp_path: Path):
+def test_port_targets_only_use_persisted_origin_decisions(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     session.add(ScanTask(id=1, target="示例集团有限公司", status="completed"))
-    session.add(
-        AiAnalysis(
-            scan_task_id=1,
-            analysis_type="dns_inference",
-            status="completed",
-            summary="NMAP_TARGET_IPS\n8.8.8.8\nEND_NMAP_TARGET_IPS",
-        )
-    )
-    session.add(
-        AiAnalysis(
-            scan_task_id=1,
-            analysis_type="report_summary",
-            status="completed",
-            summary="NMAP_TARGET_IPS\n8.8.4.4\nEND_NMAP_TARGET_IPS",
-        )
-    )
+    session.add(OriginIpCandidate(scan_task_id=1, ip="8.8.8.8", decision="include", confidence="high"))
     session.commit()
 
     by_source = NmapScanService(session, config)._targets_by_source(1)
 
-    assert by_source["ai"] == ["8.8.8.8"]
+    assert by_source["origin_confirmed"] == ["8.8.8.8"]
 
 
 def test_port_targets_exclude_dns_parking_cname_records(tmp_path: Path):
@@ -913,7 +884,7 @@ def test_port_targets_exclude_dns_parking_cname_records(tmp_path: Path):
 
     by_source = NmapScanService(session, config)._targets_by_source(1)
 
-    assert by_source["dns_public"] == ["8.8.4.4"]
+    assert by_source["origin_confirmed"] == []
 
 
 def test_port_targets_exclude_external_cname_records(tmp_path: Path):
@@ -960,4 +931,4 @@ def test_port_targets_exclude_external_cname_records(tmp_path: Path):
 
     by_source = NmapScanService(session, config)._targets_by_source(1)
 
-    assert by_source["dns_public"] == ["8.8.4.4"]
+    assert by_source["origin_confirmed"] == []

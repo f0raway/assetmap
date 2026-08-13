@@ -271,21 +271,21 @@ def test_quality_next_actions_only_retry_failed_visual_items(tmp_path: Path):
     session = get_session(engine)
     service = DeliveryQualityService(session, config)
     task = ScanTask(id=1, target="示例集团有限公司", status="completed")
-    coverage_rows = [{"环节": "URL视觉识别", "缺口等级": "低"}]
+    coverage_rows = [{"环节": "URL页面识别", "缺口等级": "低"}]
 
     manual_only = service._next_actions(
         task,
         coverage_rows,
         [{"复核类型": "manual_http_fallback_review", "识别方式": "http_probe_fallback", "分析错误": ""}],
         [],
-        ["存在低等级覆盖缺口: URL视觉识别"],
+        ["存在低等级覆盖缺口: URL页面识别"],
     )
     retry_needed = service._next_actions(
         task,
         coverage_rows,
         [{"复核类型": "automatic_retry", "识别方式": "", "分析错误": ""}],
         [],
-        ["存在低等级覆盖缺口: URL视觉识别"],
+        ["存在低等级覆盖缺口: URL页面识别"],
     )
 
     assert any("当前无自动重试项" in action for action in manual_only)
@@ -337,7 +337,7 @@ def test_quality_next_actions_explain_passive_only_port_evidence(tmp_path: Path)
     )
 
     assert any("仅被动FOFA证据" in action for action in actions)
-    assert any("assetmap nmap-scan 1 --sources nmap,fofa --rerun" in action for action in actions)
+    assert any("assetmap nmap-scan 1 --rerun" in action for action in actions)
 
 
 def test_quality_next_actions_split_service_manual_review_from_rerun(tmp_path: Path):

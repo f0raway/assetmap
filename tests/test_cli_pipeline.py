@@ -9,6 +9,7 @@ from assetmap.cli import review as review_cli
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
 from assetmap.models import WebEntrypoint
+from assetmap.stages import pipeline as stage_pipeline
 
 
 def test_manual_import_next_command_quotes_paths_with_spaces():
@@ -17,7 +18,7 @@ def test_manual_import_next_command_quotes_paths_with_spaces():
     assert command == 'assetmap run 49 --manual-file "data/manual assets.yaml"'
 
 
-def test_visual_gaps_include_http_probe_fallbacks(tmp_path: Path):
+def test_visual_gaps_do_not_retry_completed_http_probe_fallbacks(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
@@ -32,76 +33,22 @@ def test_visual_gaps_include_http_probe_fallbacks(tmp_path: Path):
     )
     session.commit()
 
-    assert pipeline_cli._has_visual_gaps(session, 49)
+    assert not stage_pipeline._has_incomplete_page_identification(config, 49)
 
 
 def test_run_pipeline_force_changed_runs_completed_downstream(monkeypatch):
-    calls: list[str] = []
+    seen: dict = {}
 
-    monkeypatch.setattr(pipeline_cli, "_stage_status_map", lambda session, task_id: {stage: "completed" for stage in cli.PIPELINE_STAGES})
-    monkeypatch.setattr(pipeline_cli, "_warn_environment", lambda *args, **kwargs: None)
+    def fake_run(config, **kwargs):
+        seen.update(kwargs)
 
-    class FakeSubdomainService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, *args, **kwargs):
-            calls.append("subdomains")
-
-    class FakeNmapScanService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, *args, **kwargs):
-            calls.append("port-scan")
-
-    class FakeAssetClassifierService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, *args, **kwargs):
-            calls.append("classify")
-
-    class FakeUrlDiscoveryService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, *args, **kwargs):
-            calls.append("url-discover")
-
-    class FakeReportResult:
-        report_path = "report.docx"
-        asset_workbook_path = "assets.xlsx"
-        web_workbook_path = "web.xlsx"
-
-    class FakeReportService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, *args, **kwargs):
-            calls.append("report")
-            return FakeReportResult()
-
-    class FakeStatus:
-        lines = ["ok"]
-
-    class FakePipelineStatusService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get(self, task_id):
-            return FakeStatus()
-
-    monkeypatch.setattr(pipeline_cli, "SubdomainService", FakeSubdomainService)
-    monkeypatch.setattr(pipeline_cli, "NmapScanService", FakeNmapScanService)
-    monkeypatch.setattr(pipeline_cli, "AssetClassifierService", FakeAssetClassifierService)
-    monkeypatch.setattr(pipeline_cli, "UrlDiscoveryService", FakeUrlDiscoveryService)
-    monkeypatch.setattr(pipeline_cli, "ReportService", FakeReportService)
-    monkeypatch.setattr(pipeline_cli, "PipelineStatusService", FakePipelineStatusService)
-
+    monkeypatch.setattr(pipeline_cli.stage_pipeline, "run", fake_run)
     pipeline_cli._run_pipeline(object(), AppConfig(), 49, progress=lambda message: None, force_changed=True)
 
-    assert calls == ["subdomains", "port-scan", "classify", "url-discover", "report"]
+    assert seen["task_id"] == 49
+    assert seen["force_changed"] is True
+    assert seen["from_stage"] == "subdomains"
+    assert seen["to_stage"] == "report"
 
 
 def test_improve_execute_manual_review_action_writes_workorder(monkeypatch):
@@ -167,13 +114,12 @@ def test_improve_execute_deduplicates_manual_review_workorder(monkeypatch):
     assert calls == ["review:49"]
 
 
-def test_improve_execute_port_action_uses_sources_from_plan(monkeypatch):
-    seen_sources: list[list[str]] = []
+def test_improve_execute_port_action_uses_fixed_sources(monkeypatch):
+    seen_calls: list[dict] = []
     config = AppConfig()
-    config.port_scan.sources_enabled = ["fofa"]
 
     def fake_run_pipeline(session, cfg, task_id, **kwargs):
-        seen_sources.append(list(cfg.port_scan.sources_enabled))
+        seen_calls.append(kwargs)
 
     monkeypatch.setattr(pipeline_cli, "_run_pipeline", fake_run_pipeline)
 
@@ -181,13 +127,14 @@ def test_improve_execute_port_action_uses_sources_from_plan(monkeypatch):
         object(),
         config,
         49,
-        [{"id": "A03", "phase": "端口发现", "mode": "automatic", "command": "assetmap nmap-scan 49 --sources nmap,fofa --rerun"}],
+        [{"id": "A03", "phase": "端口发现", "mode": "automatic", "command": "assetmap nmap-scan 49 --rerun"}],
         reports_dir=Path("reports"),
         progress=lambda message: None,
     )
 
-    assert seen_sources == [["nmap", "fofa"]]
-    assert config.port_scan.sources_enabled == ["fofa"]
+    assert len(seen_calls) == 1
+    assert seen_calls[0]["from_stage"] == "port-scan"
+    assert seen_calls[0]["rerun_ports"] is True
 
 
 def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
@@ -198,13 +145,9 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
         company_count = 3
         asset_count = 5
 
-    class FakeDiscoveryService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run(self, target, resume_task_id=None, fresh=False):
-            calls.append(f"discover:{target}:{resume_task_id}:{fresh}")
-            return FakeDiscoveryResult()
+    def fake_enterprise_discovery(config, *, target=None, task_id=None, fresh=False, progress=None):
+        calls.append(f"discover:{target}:{task_id}:{fresh}")
+        return FakeDiscoveryResult()
 
     class FakeQuality:
         status = "PASS"
@@ -240,7 +183,7 @@ def test_one_click_scan_runs_discover_pipeline_and_package(monkeypatch):
             calls.append(f"verify:{package_path}")
             return FakeVerification()
 
-    monkeypatch.setattr(pipeline_cli, "DiscoveryService", FakeDiscoveryService)
+    monkeypatch.setattr(pipeline_cli.stage_pipeline.enterprise_discovery, "run", fake_enterprise_discovery)
     monkeypatch.setattr(pipeline_cli, "_require_full_scan_environment", lambda *args: None)
     monkeypatch.setattr(pipeline_cli, "_run_pipeline", lambda *args, **kwargs: calls.append(f"pipeline:{args[2]}:{kwargs.get('manual_file')}"))
     monkeypatch.setattr(pipeline_cli, "DeliveryQualityService", FakeQualityService)

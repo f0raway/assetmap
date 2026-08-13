@@ -17,6 +17,7 @@ from assetmap.models import (
     NmapPort,
     NmapScanRun,
     NmapScanTask,
+    OriginIpCandidate,
     ScanTask,
     ServiceAsset,
     SourceRawRecord,
@@ -52,6 +53,7 @@ class ExportService:
             self._write_csv(directory / "edges.csv", bundle["edges"])
             self._write_csv(directory / "assets.csv", bundle["assets"])
             self._write_csv(directory / "raw_records.csv", bundle["raw_records"])
+            self._write_csv(directory / "origin_ip_candidates.csv", bundle["origin_ip_candidates"])
             self._write_csv(directory / "nmap_runs.csv", bundle["nmap_runs"])
             self._write_csv(directory / "nmap_ports.csv", bundle["nmap_ports"])
             self._write_csv(directory / "service_assets.csv", bundle["service_assets"])
@@ -90,6 +92,9 @@ class ExportService:
         ).all()
         dns_records = self.session.exec(
             select(DnsRecord).where(DnsRecord.scan_task_id == task_id)
+        ).all()
+        origin_ip_candidates = self.session.exec(
+            select(OriginIpCandidate).where(OriginIpCandidate.scan_task_id == task_id)
         ).all()
         tool_runs = self.session.exec(
             select(SubdomainToolRun).where(SubdomainToolRun.scan_task_id == task_id)
@@ -169,6 +174,7 @@ class ExportService:
             "subdomain_task": subtask.model_dump(mode="json") if subtask else None,
             "subdomains": [row.model_dump(mode="json") for row in subdomains],
             "dns_records": [row.model_dump(mode="json") for row in dns_records],
+            "origin_ip_candidates": [row.model_dump(mode="json") for row in origin_ip_candidates],
             "subdomain_tool_runs": [
                 {
                     "root_domain": row.root_domain,
@@ -291,7 +297,7 @@ class ExportService:
                     "",
                     "## Web Entrypoints",
                     "",
-                    "| URL | Status | Title | System | Purpose | Tech | Screenshot |",
+                    "| URL | Status | Title | System | Purpose | Tech | Rendered HTML |",
                     "| --- | --- | --- | --- | --- | --- | --- |",
                 ]
             )
@@ -301,6 +307,6 @@ class ExportService:
                     f"| {entry['url']} | {entry.get('http_status') or ''} "
                     f"| {entry.get('title') or ''} | {visual.get('system_name') or ''} "
                     f"| {visual.get('site_purpose') or ''} | {', '.join(entry.get('tech_stack') or [])} "
-                    f"| {visual.get('screenshot_path') or ''} |"
+                    f"| {visual.get('rendered_html_path') or ''} |"
                 )
         return "\n".join(lines) + "\n"

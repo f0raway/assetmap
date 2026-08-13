@@ -1,78 +1,26 @@
-# assetmap 深度测绘配置示例。
-# 仅对已获得明确授权的目标使用；首次运行前请填写所有 YOUR_* 凭证。
-
-# 本地任务数据库。每个流水线阶段均从此处读取并写入可续跑的结果。
+# assetmap 深度测绘配置。仅对已获授权的目标使用。
 database:
   url: sqlite:///data/assetmap.db
 
-# 企业范围：累计持股比例达到 47% 的子公司会被纳入测绘范围。
-org:
-  control_threshold: 0.47
-  max_depth: 10  # 最多追踪十层控股关系。
-
-# 企业、备案资产采集器。tycid 与 auth_token 必填。
-enscan:
-  script: assetmap/collectors/tyc_invest_crawler.py
-  output_dir: data/enscan
-  timeout_seconds: 1800
+# 企业发现：填写天眼查凭证与股权穿透边界。
+enterprise_discovery:
   tycid: YOUR_TYCID
   auth_token: YOUR_TYC_AUTH_TOKEN
-  request_delay_seconds: 1.0
-  request_timeout_seconds: 20
-  asset_workers: 5
-  verbose: false
+  control_threshold: 0.47
+  max_depth: 10
 
-# 本地外部工具与主动测绘参数。
+# 域名测绘仅需配置 subfinder 的 Key 文件和 dnsx 字典。
+domain_mapping:
+  subfinder_provider_config: config/subfinder/provider-config.yaml
+  dnsx_wordlist: data/wordlists/Subdomain.txt
+
 tools:
-  tools_dir: tools
-  subdomain_tools_enabled:
-    - subfinder  # 被动子域名发现。
-    - dnsx       # 使用字典发现子域名并解析 DNS。
-  # 完整字典在 300 请求/秒下理论执行时间超过 40 分钟，预留 90 分钟。
-  subdomain_tool_timeout_seconds: 5400
-  # 避免大型目标因有效结果超过 1 万行而整段跳过解析。
-  subdomain_tool_max_output_lines: 200000
-  subfinder_command: '{binary} -d {domain} -silent -all -o {output}'
-  # 深度模式使用项目内置的完整子域名字典（约 73 万条）。
-  dnsx_command: '{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc'
-  wordlist: data/wordlists/Subdomain.txt
-  # 唯一的主扫描命令：一次对全部目标 IP 执行全端口服务识别。
-  # 支持占位符：{binary}、{targets_file}、{xml_output}、{normal_output}。
-  nmap_command: '{binary} -Pn -p- --open -sV --version-intensity 5 --min-hostgroup 16 --min-rate 500 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit --max-retries 2 --host-timeout 3600s -iL {targets_file} -oX {xml_output} -oN {normal_output}'
-  # FOFA 发现的端口会用此命令再次确认服务信息。
-  nmap_service_detect_command: '{binary} -Pn -sV --version-intensity 5 -p {ports} {target} -oX {xml_output} -oN {normal_output}'
-  # 仅用于并发执行 FOFA 端口复核；主扫描始终是一次批量任务。
-  nmap_max_workers: 3
-  nmap_timeout_seconds: 5400
+  nmap_command: '{binary} -Pn -p- --open -sV --version-intensity 5 --min-hostgroup 16 --min-rate 500 --initial-rtt-timeout 300ms --max-rtt-timeout 2000ms --min-rtt-timeout 100ms --defeat-rst-ratelimit --max-retries 2 --script-timeout 60s -iL {targets_file} -oX {xml_output} -oN {normal_output}'
 
-# 端口发现同时采用主动 Nmap 与被动 FOFA；主动目标来自 AI、手工资产和公网 DNS 记录。
-port_scan:
-  sources_enabled:
-    - nmap
-    - fofa
-  target_sources_enabled:
-    - ai
-    - manual
-    - dns_public
-
-# FOFA 凭证。full=true 与 size=1000 会增加额度消耗。
 fofa:
-  base_url: https://fofa.info
   email: YOUR_FOFA_EMAIL
   api_key: YOUR_FOFA_API_KEY
-  fields: host,ip,port,protocol,title,server
-  size: 1000
-  full: true
-  timeout_seconds: 30
 
-# DNS 解析并发。可按网络环境填写可信 DNS 服务器地址。
-dns:
-  timeout_seconds: 5.0
-  lifetime_seconds: 8.0
-  nameservers: []
-  max_workers: 50
-
-# OpenAI 兼容 AI 网关。深度模式默认开启；必须替换占位符密钥。
 ai:
   enabled: true
   base_url: https://api.openai.com/v1
@@ -81,38 +29,15 @@ ai:
   model: gpt-4o
   timeout_seconds: 240
 
-# HTTP/HTTPS 服务探测。响应体最多保留 1 MiB，并按 IP 尝试最多 200 个域名。
 web_probe:
   timeout_seconds: 8.0
-  max_workers: 50
-  max_body_bytes: 1048576
-  max_domains_per_ip: 200
   user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
 
-# Web 截图与视觉识别。每次最多处理 200 页；下次运行会继续处理其余入口。
+# Web 页面识别：所有待处理页面按顺序处理，不设总量上限。
 url_discovery:
+  # 单个页面的常规打开超时；页面发生卡死时由下面的硬超时回收。
   timeout_seconds: 15.0
+  # 单个页面（含浏览器加载和 DOM 提取）的最长运行时间，不限制整个阶段的总时长。
   page_hard_timeout_seconds: 60
+  # 单页 HTML/DOM 文本提交给 AI 的最长等待时间。
   ai_timeout_seconds: 240
-  visual_max_pages: 200
-  screenshot_dir: data/screenshots
-  browser_channel: ""  # 空字符串表示使用 Playwright 自带 Chromium。
-  browser_headless: true
-  browser_wait_until: domcontentloaded
-  browser_wait_after_load_ms: 2500
-  screenshot_width: 1365
-  screenshot_height: 900
-  screenshot_full_page: true
-  screenshot_detail: high
-  allow_http_statuses:
-    - 200
-    - 201
-    - 202
-    - 204
-    - 301
-    - 302
-    - 303
-    - 307
-    - 308
-    - 401
-    - 403

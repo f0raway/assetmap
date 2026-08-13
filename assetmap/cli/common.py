@@ -25,7 +25,7 @@ def _exit_interrupted() -> None:
 
 def _bootstrap(config_path: Path = DEFAULT_CONFIG_PATH):
     config = load_config(config_path)
-    engine = create_db_and_engine(config.database.url)
+    engine = create_db_and_engine(config.database_url)
     session = get_session(engine)
     return config, engine, session
 
@@ -73,16 +73,26 @@ def _stage_status_map(session, task_id: int) -> dict[str, str]:
 def _should_run_stage(stage_status: dict[str, str], stage: str, force: bool = False) -> bool:
     if force:
         return True
-    return stage_status.get(stage) not in {"completed", "skipped"}
+    return stage_status.get(stage) not in {"completed", "skipped", "completed_with_gaps"}
 
 
 def _has_visual_gaps(session, task_id: int) -> bool:
+    """Return only genuinely incomplete page-identification work.
+
+    An ``http_probe_fallback`` is a completed, explicitly labelled degraded
+    result.  Retrying it during every ordinary pipeline resume can reopen a
+    large, slow Chromium batch without any user intent.  Operators can still
+    retry those entries explicitly through the standalone Web stage.
+    """
     rows = session.exec(select(WebEntrypoint).where(WebEntrypoint.scan_task_id == task_id)).all()
     for row in rows:
         visual = (row.evidence or {}).get("visual_analysis")
         if not isinstance(visual, dict):
-            return True
-        if visual.get("analysis_method") == "http_probe_fallback":
+            if (row.evidence or {}).get("visual_analysis_error"):
+                return True
+            if not visual:
+                return True
+        if isinstance(visual, dict) and visual.get("analysis_method") == "screenshot_ai":
             return True
     return False
 
@@ -91,11 +101,13 @@ def _warn_environment(
     config: AppConfig,
     include_subdomain_tools: bool = True,
     include_nmap: bool = True,
+    include_httpx: bool = False,
 ) -> None:
-    resolver = ToolResolver(config.tools)
+    resolver = ToolResolver(config.tools, config.config_dir)
     results = resolver.check_environment(
         include_subdomain_tools=include_subdomain_tools,
         include_nmap=include_nmap,
+        include_httpx=include_httpx,
     )
     for result in results:
         if not result["ok"]:
