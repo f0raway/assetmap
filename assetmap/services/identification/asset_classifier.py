@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 import json
+import os
 import re
+import shlex
 import subprocess
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
-import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from assetmap.config import AppConfig
+from assetmap.config import AppConfig, HTTPX_RATE_LIMIT, HTTPX_THREADS
 from assetmap.models import (
     AssetClassificationTask,
     DnsRecord,
@@ -23,13 +21,9 @@ from assetmap.models import (
     ServiceAsset,
     WebProbeResult,
 )
-from assetmap.services.mapping.nmap_scan import _quote, _safe_ip
 from assetmap.services.runtime.tool_resolver import ToolResolver
 
 
-TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-TAG_PATTERN = re.compile(r"<[^>]+>")
-WHITESPACE_PATTERN = re.compile(r"\s+")
 LIKELY_WEB_PORTS = {
     80,
     81,
@@ -94,51 +88,25 @@ def _url(scheme: str, host: str, port: int) -> str:
     return f"{scheme}://{_host_for_url(host)}:{port}/"
 
 
-def _title(text: str) -> str | None:
-    match = TITLE_PATTERN.search(text)
-    if not match:
+def _normalise_probe_url(value: object) -> str | None:
+    """Normalise httpx JSON fields back to the URL used as a checkpoint key."""
+    text = str(value or "").strip()
+    if not text:
         return None
-    value = WHITESPACE_PATTERN.sub(" ", TAG_PATTERN.sub("", match.group(1))).strip()
-    return value[:300] or None
+    parsed = urlparse(text if "://" in text else f"//{text}")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return _url(scheme, host, port or (443 if scheme == "https" else 80))
 
 
-def _hash_body(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def _tech_stack(headers: dict[str, str], body_text: str, title: str | None) -> list[str]:
-    haystack = f"{title or ''}\n{body_text[:20000]}".lower()
-    found: list[str] = []
-    for header_name in ("server", "x-powered-by", "x-generator"):
-        value = headers.get(header_name)
-        if value:
-            found.append(value[:120])
-    markers = {
-        "WordPress": ["wp-content", "wp-includes"],
-        "Drupal": ["drupal-settings-json"],
-        "Joomla": ["content=\"joomla"],
-        "Vue": ["__vue__", "vue.js"],
-        "React": ["reactroot", "__react"],
-        "Swagger": ["swagger-ui", "api-docs"],
-        "Spring": ["whitelabel error page", "jsessionid"],
-        "ASP.NET": ["asp.net", "__viewstate"],
-        "PHP": ["phpsessid"],
-        "ThinkPHP": ["thinkphp"],
-        "RuoYi": ["ruoyi", "若依"],
-        "宝塔": ["宝塔", "bt.cn"],
-        "泛微 OA": ["weaver", "ecology"],
-        "致远 OA": ["seeyon"],
-        "用友": ["yonyou", "用友"],
-        "金蝶": ["kingdee", "金蝶"],
-    }
-    for name, needles in markers.items():
-        if any(needle in haystack for needle in needles):
-            found.append(name)
-    deduped: list[str] = []
-    for item in found:
-        if item and item not in deduped:
-            deduped.append(item)
-    return deduped
+def _quote(value: str) -> str:
+    return subprocess.list2cmdline([value]) if os.name == "nt" else shlex.quote(value)
 
 
 class AssetClassifierService:
@@ -172,10 +140,6 @@ class AssetClassifierService:
             self._log(f"[classify] open ports: {len(ports)}")
             if rerun:
                 self._clear_previous(scan_task_id)
-            task.stage = "service_detect"
-            self.session.add(task)
-            self.session.commit()
-            self._detect_services(scan_task_id, ports, rerun=rerun)
             task.stage = "web_probe"
             self.session.add(task)
             self.session.commit()
@@ -279,38 +243,53 @@ class AssetClassifierService:
     def _probe_web(self, scan_task_id: int, ports: list[NmapPort], rerun: bool = False) -> None:
         domains_by_ip = self._domains_by_ip(scan_task_id)
         fofa_hosts_by_port = self._fofa_hosts_by_port(scan_task_id)
-        jobs: list[tuple[str, int, str, str]] = []
-        seen_jobs: set[tuple[str, int, str, str]] = set()
+        primary_jobs: list[tuple[str, int, str, str]] = []
+        saved_fallback_jobs: list[tuple[str, int, str, str]] = []
+        seen: set[tuple[str, int, str, str]] = set()
         skipped_non_web = 0
         for port in ports:
             if not self._should_probe_web(port):
                 skipped_non_web += 1
                 continue
-            hosts = self._probe_hosts(scan_task_id, port, domains_by_ip, fofa_hosts_by_port, rerun=rerun)
+            hosts = self._probe_hosts(port, domains_by_ip, fofa_hosts_by_port)
             for host in hosts:
-                for scheme in self._schemes_for_port(port.port):
-                    if not rerun and self._probe_exists(scan_task_id, port.target_ip, port.port, scheme, host):
-                        continue
-                    job = (port.target_ip, port.port, scheme, host)
-                    if job in seen_jobs:
-                        continue
-                    seen_jobs.add(job)
-                    jobs.append(job)
-        if not jobs:
+                primary, fallback = self._schemes_for_port(port.port)
+                primary_result = None if rerun else self._httpx_checkpoint(
+                    scan_task_id, port.target_ip, port.port, primary, host
+                )
+                if primary_result is None:
+                    job = (port.target_ip, port.port, primary, host)
+                    if job not in seen:
+                        seen.add(job)
+                        primary_jobs.append(job)
+                    continue
+                if self._should_try_fallback(primary_result):
+                    fallback_result = self._httpx_checkpoint(scan_task_id, port.target_ip, port.port, fallback, host)
+                    job = (port.target_ip, port.port, fallback, host)
+                    if fallback_result is None and job not in seen:
+                        seen.add(job)
+                        saved_fallback_jobs.append(job)
+        if not primary_jobs and not saved_fallback_jobs:
             if skipped_non_web:
                 self._log(f"[classify] web probe skipped obvious non-web ports: {skipped_non_web}")
             return
         if skipped_non_web:
             self._log(f"[classify] web probe skipped obvious non-web ports: {skipped_non_web}")
-        self._log(f"[classify] web probe jobs: {len(jobs)}")
-        workers = min(max(1, self.config.web_probe.max_workers), len(jobs))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(self._probe_one, scan_task_id, target_ip, port, scheme, host)
-                for target_ip, port, scheme, host in jobs
-            ]
-            for future in as_completed(futures):
-                future.result()
+        self._run_httpx_batch(scan_task_id, "primary", primary_jobs)
+
+        fallback_jobs = list(saved_fallback_jobs)
+        fallback_seen = set(fallback_jobs)
+        for target_ip, port, scheme, host in primary_jobs:
+            result = self._probe_record(scan_task_id, target_ip, port, scheme, host)
+            if result and not self._should_try_fallback(result):
+                continue
+            fallback = self._schemes_for_port(port)[1]
+            job = (target_ip, port, fallback, host)
+            if job not in fallback_seen and not self._probe_exists(scan_task_id, *job):
+                fallback_seen.add(job)
+                fallback_jobs.append(job)
+        if fallback_jobs:
+            self._run_httpx_batch(scan_task_id, "fallback", fallback_jobs)
 
     def _should_probe_web(self, port: NmapPort) -> bool:
         service = (port.service or "").lower().strip()
@@ -331,11 +310,9 @@ class AssetClassifierService:
 
     def _probe_hosts(
         self,
-        scan_task_id: int,
         port: NmapPort,
         domains_by_ip: dict[str, list[str]],
         fofa_hosts_by_port: dict[tuple[str, int], list[str]],
-        rerun: bool = False,
     ) -> list[str]:
         fofa_hosts = fofa_hosts_by_port.get((port.target_ip, port.port), [])
         dns_hosts = domains_by_ip.get(port.target_ip, [])
@@ -349,21 +326,30 @@ class AssetClassifierService:
         for host in candidates:
             if host not in hosts:
                 hosts.append(host)
-        batch_size = max(1, self.config.web_probe.max_domains_per_ip) + 1
-        if rerun:
-            return hosts[:batch_size]
-        unprobed = [
-            host
-            for host in hosts
-            if any(
-                not self._probe_exists(scan_task_id, port.target_ip, port.port, scheme, host)
-                for scheme in self._schemes_for_port(port.port)
-            )
-        ]
-        return unprobed[:batch_size]
+        return hosts
 
     def _schemes_for_port(self, port: int) -> tuple[str, str]:
         return ("https", "http") if port in {443, 8443, 9443} else ("http", "https")
+
+    def _should_try_fallback(self, result: WebProbeResult) -> bool:
+        """A protocol-mismatch page is evidence, not a usable Web response."""
+        if result.status != "responded":
+            return True
+        if result.scheme != "http" or result.http_status != 400:
+            return False
+        return self._is_protocol_mismatch(result)
+
+    def _is_protocol_mismatch(self, result: WebProbeResult) -> bool:
+        payload = (result.raw_headers or {}).get("httpx")
+        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else ""
+        text = " ".join([result.title or "", result.error_message or "", payload_text]).lower()
+        markers = (
+            "plain http request was sent to https port",
+            "plain http request to an https server",
+            "speaking plain http to an ssl-enabled server port",
+            "requires tls",
+        )
+        return any(marker in text for marker in markers)
 
     def _probe_exists(self, scan_task_id: int, target_ip: str, port: int, scheme: str, host: str) -> bool:
         return (
@@ -379,56 +365,236 @@ class AssetClassifierService:
             is not None
         )
 
-    def _probe_one(self, scan_task_id: int, target_ip: str, port: int, scheme: str, host: str) -> None:
-        headers = {
-            "User-Agent": self.config.web_probe.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "close",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        url = _url(scheme, host, port)
+    def _run_httpx_batch(
+        self,
+        scan_task_id: int,
+        phase: str,
+        jobs: list[tuple[str, int, str, str]],
+    ) -> None:
+        if not jobs:
+            return
+        output_dir = self.config.data_path("classify", f"task_{scan_task_id}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_file = output_dir / f"httpx_{phase}_input.txt"
+        output_file = output_dir / f"httpx_{phase}.jsonl"
+        job_by_url = {_url(scheme, host, port): (target_ip, port, scheme, host) for target_ip, port, scheme, host in jobs}
+        input_file.write_text("\n".join(job_by_url) + "\n", encoding="utf-8")
+        command = self._httpx_command(input_file, output_file)
+        self._log(
+            f"[httpx] {phase}: inputs={len(jobs)}, 内部并发={HTTPX_THREADS}, "
+            f"限速={HTTPX_RATE_LIMIT}/秒, JSONL={output_file}"
+        )
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        output_lines: list[str] = []
+        parsed = 0
+        with output_file.open("w", encoding="utf-8") as result_log:
+            if process.stdout:
+                for line in process.stdout:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError:
+                        output_lines.append(text)
+                        self._log(f"[httpx] {phase} | {text}")
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    job = self._job_from_httpx_payload(payload, job_by_url)
+                    if not job:
+                        self._log(f"[httpx] {phase} | 忽略无法关联输入的响应")
+                        continue
+                    result_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    result_log.flush()
+                    self._save_httpx_probe(scan_task_id, job, payload)
+                    parsed += 1
+                    self._log(self._httpx_result_message(phase, job, payload))
+        exit_code = process.wait()
+        if exit_code != 0:
+            raise RuntimeError(f"httpx {phase} failed (exit={exit_code}): {' | '.join(output_lines[-5:])[:1000]}")
+        for job in jobs:
+            if self._probe_record(scan_task_id, *job) is None:
+                self._save_httpx_failure(scan_task_id, job, "httpx returned no HTTP response")
+        self._log(f"[httpx] {phase}: responded={parsed}, no_response={len(jobs) - parsed}")
+
+    def _httpx_command(self, input_file: Path, output_file: Path) -> str:
+        binary = ToolResolver(self.config.tools, self.config.config_dir).executable("httpx")
+        if not binary:
+            raise ValueError("ProjectDiscovery httpx not found. Install it and run `assetmap env-check`.")
+        return self.config.tools.httpx_command.format(
+            binary=_quote(str(binary)),
+            input_file=_quote(str(input_file)),
+            output_file=_quote(str(output_file)),
+            timeout=max(1, int(self.config.web_probe.timeout_seconds)),
+            user_agent_header=_quote(f"User-Agent: {self.config.web_probe.user_agent}"),
+        )
+
+    def _httpx_result_message(
+        self,
+        phase: str,
+        job: tuple[str, int, str, str],
+        payload: dict,
+    ) -> str:
+        _, port, scheme, host = job
+        if scheme == "http" and self._payload_is_protocol_mismatch(payload):
+            return f"[httpx] {phase} | {scheme}://{_host_for_url(host)}:{port} -> 协议不匹配，稍后改用 HTTPS"
+        status = payload.get("status_code") or "?"
+        title = str(payload.get("title") or "").strip().replace("\n", " ")[:80]
+        suffix = f" | {title}" if title else ""
+        return f"[httpx] {phase} | {scheme}://{_host_for_url(host)}:{port} -> HTTP {status}{suffix}"
+
+    def _payload_is_protocol_mismatch(self, payload: dict) -> bool:
+        text = json.dumps(payload, ensure_ascii=False).lower()
+        markers = (
+            "plain http request was sent to https port",
+            "plain http request to an https server",
+            "speaking plain http to an ssl-enabled server port",
+            "requires tls",
+        )
+        return any(marker in text for marker in markers)
+
+    def _save_httpx_results(
+        self,
+        scan_task_id: int,
+        output_file: Path,
+        job_by_url: dict[str, tuple[str, int, str, str]],
+    ) -> int:
+        if not output_file.exists():
+            return 0
+        saved = 0
+        for line in output_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            job = self._job_from_httpx_payload(payload, job_by_url)
+            if not job:
+                continue
+            self._save_httpx_probe(scan_task_id, job, payload)
+            saved += 1
+        return saved
+
+    def _job_from_httpx_payload(
+        self,
+        payload: dict,
+        job_by_url: dict[str, tuple[str, int, str, str]],
+    ) -> tuple[str, int, str, str] | None:
+        for field in ("input", "url", "final_url"):
+            raw = str(payload.get(field) or "")
+            if raw in job_by_url:
+                return job_by_url[raw]
+            normalised = _normalise_probe_url(raw)
+            if normalised and normalised in job_by_url:
+                return job_by_url[normalised]
+        return None
+
+    def _save_httpx_probe(self, scan_task_id: int, job: tuple[str, int, str, str], payload: dict) -> None:
+        target_ip, port, scheme, host = job
+        hashes = payload.get("hashes") if isinstance(payload.get("hashes"), dict) else {}
+        technologies = payload.get("tech") or payload.get("technologies") or []
+        if not isinstance(technologies, list):
+            technologies = [str(technologies)]
+        status_code = payload.get("status_code")
+        try:
+            status_code = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        result = self._probe_record(scan_task_id, target_ip, port, scheme, host) or WebProbeResult(
+            scan_task_id=scan_task_id, target_ip=target_ip, port=port, scheme=scheme, host=host, url=_url(scheme, host, port)
+        )
+        protocol_mismatch = scheme == "http" and status_code == 400 and self._payload_is_protocol_mismatch(payload)
+        result.status = "protocol_mismatch" if protocol_mismatch else "responded"
+        result.http_status = status_code
+        result.final_url = str(payload.get("final_url") or payload.get("url") or result.url)
+        result.title = str(payload.get("title") or "")[:300] or None
+        result.server = str(payload.get("webserver") or payload.get("server") or "")[:300] or None
+        result.content_type = str(payload.get("content_type") or "")[:300] or None
+        result.body_hash = str(hashes.get("sha256") or payload.get("body_sha256") or payload.get("hash") or "") or None
+        try:
+            result.body_length = int(payload.get("content_length")) if payload.get("content_length") is not None else None
+        except (TypeError, ValueError):
+            result.body_length = None
+        result.tech_stack = [str(item)[:120] for item in technologies]
+        result.error_message = "HTTP request was sent to an HTTPS-only port" if protocol_mismatch else None
+        result.raw_headers = {"probe_source": "projectdiscovery_httpx", "httpx": payload}
+        self.session.add(result)
+        self.session.commit()
+
+    def _save_httpx_failure(self, scan_task_id: int, job: tuple[str, int, str, str], message: str) -> None:
+        target_ip, port, scheme, host = job
         result = WebProbeResult(
             scan_task_id=scan_task_id,
             target_ip=target_ip,
             port=port,
             scheme=scheme,
             host=host,
-            url=url,
+            url=_url(scheme, host, port),
+            status="failed",
+            error_message=message,
+            raw_headers={"probe_source": "projectdiscovery_httpx"},
         )
+        self.session.add(result)
         try:
-            with httpx.Client(
-                timeout=self.config.web_probe.timeout_seconds,
-                follow_redirects=True,
-                verify=False,
-                trust_env=False,
-                headers=headers,
-            ) as client:
-                response = client.get(url)
-            content = response.content[: self.config.web_probe.max_body_bytes]
-            text = content.decode(response.encoding or "utf-8", errors="replace")
-            response_headers = {key.lower(): value for key, value in response.headers.items()}
-            result.status = "responded"
-            result.http_status = response.status_code
-            result.final_url = str(response.url)
-            result.title = _title(text)
-            result.server = response_headers.get("server")
-            result.powered_by = response_headers.get("x-powered-by")
-            result.content_type = response_headers.get("content-type")
-            result.body_hash = _hash_body(content)
-            result.body_length = len(response.content)
-            result.tech_stack = _tech_stack(response_headers, text, result.title)
-            result.raw_headers = dict(response.headers)
-        except Exception as exc:
-            result.status = "failed"
-            result.error_message = str(exc)[:1000]
-        with Session(self.session.get_bind()) as session:
-            session.add(result)
-            try:
-                session.commit()
-            except IntegrityError:
-                session.rollback()
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+
+    def _probe_record(
+        self,
+        scan_task_id: int,
+        target_ip: str,
+        port: int,
+        scheme: str,
+        host: str,
+    ) -> WebProbeResult | None:
+        return self.session.exec(
+            select(WebProbeResult).where(
+                WebProbeResult.scan_task_id == scan_task_id,
+                WebProbeResult.target_ip == target_ip,
+                WebProbeResult.port == port,
+                WebProbeResult.scheme == scheme,
+                WebProbeResult.host == host,
+            )
+        ).first()
+
+    def _httpx_checkpoint(
+        self,
+        scan_task_id: int,
+        target_ip: str,
+        port: int,
+        scheme: str,
+        host: str,
+    ) -> WebProbeResult | None:
+        """Keep only checkpoints created by the current ProjectDiscovery probe."""
+        result = self._probe_record(scan_task_id, target_ip, port, scheme, host)
+        if not result:
+            return None
+        evidence = result.raw_headers or {}
+        if evidence.get("probe_source") == "projectdiscovery_httpx":
+            # Results created by the first httpx migration used "responded"
+            # for this page. Upgrade them before they can become Web assets.
+            if result.status == "responded" and self._is_protocol_mismatch(result):
+                result.status = "protocol_mismatch"
+                result.error_message = "HTTP request was sent to an HTTPS-only port"
+                self.session.add(result)
+                self.session.commit()
+            return result
+        self.session.delete(result)
+        self.session.commit()
+        self._log(f"[httpx] 迁移旧检查点：{scheme}://{_host_for_url(host)}:{port}")
+        return None
 
     def _classify(self, scan_task_id: int, ports: list[NmapPort]) -> None:
         probes = self.session.exec(select(WebProbeResult).where(WebProbeResult.scan_task_id == scan_task_id)).all()
@@ -488,13 +654,17 @@ class AssetClassifierService:
             self._log("[classify] web probe results: 0")
             return
         responded = [row for row in rows if row.status == "responded"]
-        failed = len(rows) - len(responded)
+        mismatches = [row for row in rows if row.status == "protocol_mismatch"]
+        failed = len(rows) - len(responded) - len(mismatches)
         status_counts: dict[int, int] = {}
         for row in responded:
             if row.http_status is not None:
                 status_counts[row.http_status] = status_counts.get(row.http_status, 0) + 1
         top_status = ", ".join(f"{status}={count}" for status, count in sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))[:8])
-        self._log(f"[classify] web probe results: total={len(rows)}, responded={len(responded)}, failed={failed}")
+        self._log(
+            f"[classify] web probe results: total={len(rows)}, responded={len(responded)}, "
+            f"protocol_mismatch={len(mismatches)}, failed={failed}"
+        )
         if top_status:
             self._log(f"[classify] http status summary: {top_status}")
         audit = self._write_web_probe_audit(scan_task_id, rows)
@@ -510,10 +680,12 @@ class AssetClassifierService:
         self._log(f"[classify] service classification audit: {audit}")
 
     def _write_web_probe_audit(self, scan_task_id: int, rows: list[WebProbeResult]) -> Path:
-        output_dir = Path("data") / "classify" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("classify", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         status_counts: dict[str, int] = {}
         error_counts: dict[str, int] = {}
+        protocol_mismatch_count = 0
+        protocol_mismatches = []
         failed_samples = []
         for row in rows:
             if row.status == "responded" and row.http_status is not None:
@@ -532,22 +704,36 @@ class AssetClassifierService:
                             "error": error,
                         }
                     )
+            elif row.status == "protocol_mismatch":
+                protocol_mismatch_count += 1
+                if len(protocol_mismatches) < 30:
+                    protocol_mismatches.append(
+                        {
+                            "target_ip": row.target_ip,
+                            "port": row.port,
+                            "scheme": row.scheme,
+                            "host": row.host,
+                            "message": row.error_message,
+                        }
+                    )
         payload = {
             "scan_task_id": scan_task_id,
             "generated_at": _utcnow().isoformat(),
             "total": len(rows),
             "responded": sum(1 for row in rows if row.status == "responded"),
+            "protocol_mismatch": protocol_mismatch_count,
             "failed": sum(1 for row in rows if row.status == "failed"),
             "http_status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))),
             "error_counts": dict(sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))[:20]),
             "failed_samples": failed_samples,
+            "protocol_mismatch_samples": protocol_mismatches,
         }
         path = output_dir / "web_probe_audit.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
     def _write_service_classification_audit(self, scan_task_id: int, rows: list[ServiceAsset]) -> Path:
-        output_dir = Path("data") / "classify" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("classify", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         kind_counts: dict[str, int] = {}
         host_mode_counts: dict[str, int] = {}
@@ -757,139 +943,3 @@ class AssetClassifierService:
         else:
             self.session.add(asset)
         self.session.commit()
-
-    def _detect_services(self, scan_task_id: int, ports: list[NmapPort], rerun: bool = False) -> None:
-        grouped: dict[str, list[NmapPort]] = {}
-        for port in ports:
-            if not self._needs_supplemental_service_detect(port):
-                continue
-            grouped.setdefault(port.target_ip, []).append(port)
-        if grouped:
-            self._log(f"[classify] supplemental -sV targets: {len(grouped)} hosts")
-        for target_ip, host_ports in grouped.items():
-            existing = [
-                self._service_asset(scan_task_id, port)
-                for port in host_ports
-            ]
-            if not rerun and existing and all(row and row.evidence.get("service_detect_command") for row in existing):
-                self._log(f"[classify] skip service detect: {target_ip}")
-                continue
-            self._detect_host_services(scan_task_id, target_ip, host_ports)
-
-    def _needs_supplemental_service_detect(self, port: NmapPort) -> bool:
-        """Only verify ports that were not already covered by a deep Nmap scan.
-
-        The default port-scan command includes ``-sV --version-intensity 5`` and
-        persists that result in ``NmapPort``. Repeating the same scan here for
-        every active result can double the longest stage of a task. FOFA-only
-        results, or projects that intentionally remove ``-sV`` from their Nmap
-        command, still need this focused verification before classification.
-        """
-        payload = port.raw_payload or {}
-        sources = payload.get("sources")
-        has_nmap_evidence = (
-            "nmap" in sources
-            if isinstance(sources, list)
-            else payload.get("source") == "nmap" or isinstance(payload.get("nmap"), dict)
-        )
-        if not has_nmap_evidence:
-            return True
-        command = self.config.tools.nmap_command.lower()
-        return "-sv" not in command and "--service-version" not in command and " -a" not in command
-
-    def _detect_host_services(self, scan_task_id: int, target_ip: str, ports: list[NmapPort]) -> None:
-        executable = ToolResolver(self.config.tools).nmap_executable()
-        if not executable:
-            for port in ports:
-                self._upsert_service_asset(
-                    ServiceAsset(
-                        scan_task_id=scan_task_id,
-                        target_ip=port.target_ip,
-                        protocol=port.protocol,
-                        port=port.port,
-                        asset_kind="unknown",
-                        service=port.service,
-                        product=port.product,
-                        version=port.version,
-                        evidence={"service_detect_error": "nmap executable not found"},
-                    )
-                )
-            return
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}" / "service_detect"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        port_list = ",".join(str(port.port) for port in sorted(ports, key=lambda item: item.port))
-        stem = f"{_safe_ip(target_ip)}_{port_list.replace(',', '_')}"
-        xml_output = output_dir / f"{stem}.xml"
-        normal_output = output_dir / f"{stem}.txt"
-        command = self.config.tools.nmap_service_detect_command.format(
-            binary=_quote(str(executable)),
-            target=_quote(target_ip),
-            port=port_list,
-            ports=port_list,
-            xml_output=_quote(str(xml_output)),
-            normal_output=_quote(str(normal_output)),
-            output_dir=_quote(str(output_dir)),
-        )
-        try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.config.tools.nmap_timeout_seconds,
-            )
-            parsed = self._parse_service_xml(xml_output) if xml_output.exists() else {}
-            for port in ports:
-                details = parsed.get(port.port, {})
-                self._upsert_service_asset(
-                    ServiceAsset(
-                        scan_task_id=scan_task_id,
-                        target_ip=target_ip,
-                        protocol=port.protocol,
-                        port=port.port,
-                        asset_kind="unknown",
-                        service=details.get("service") or port.service,
-                        product=details.get("product") or port.product,
-                        version=details.get("version") or port.version,
-                        evidence={
-                            "service_detect_command": command,
-                            "service_detect_exit_code": proc.returncode,
-                            "service_detect_output": str(normal_output),
-                        },
-                    )
-                )
-        except Exception as exc:
-            for port in ports:
-                self._upsert_service_asset(
-                    ServiceAsset(
-                        scan_task_id=scan_task_id,
-                        target_ip=target_ip,
-                        protocol=port.protocol,
-                        port=port.port,
-                        asset_kind="unknown",
-                        service=port.service,
-                        product=port.product,
-                        version=port.version,
-                        evidence={"service_detect_error": str(exc)[:1000]},
-                    )
-                )
-
-    def _parse_service_xml(self, path: Path) -> dict[int, dict[str, str | None]]:
-        try:
-            root = ET.parse(path).getroot()
-        except ET.ParseError:
-            return {}
-        result: dict[int, dict[str, str | None]] = {}
-        for port in root.findall(".//port"):
-            port_id = int(port.attrib.get("portid", "0"))
-            service = port.find("service")
-            if service is None:
-                continue
-            result[port_id] = {
-                "service": service.attrib.get("name"),
-                "product": service.attrib.get("product"),
-                "version": service.attrib.get("version"),
-            }
-        return result

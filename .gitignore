@@ -41,3 +41,4 @@ data/*
 reports/
 deliveries/
 exports/
+config/subfinder/provider-config.yaml

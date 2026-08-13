@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,7 +39,7 @@ EXPECTED_ASSET_SHEETS = {
     "交付审计文件",
     "非域名资产",
 }
-EXPECTED_WEB_SHEETS = {"阅读导航", "重点Web资产", "截图证据", "Web资产详情", "视觉复核清单"}
+EXPECTED_WEB_SHEETS = {"阅读导航", "重点Web资产", "HTML证据", "Web资产详情", "页面识别复核清单"}
 
 
 @dataclass
@@ -71,8 +74,8 @@ class DeliveryQualityService:
         coverage_rows = context["coverage_rows"]
         visual_failed = self._visual_failed(bundle)
         if visual_failed:
-            failures.append(f"仍有 {visual_failed} 个 Web 入口视觉识别失败")
-        if stats.get("Web入口数量", 0) and stats.get("已完成视觉识别Web入口", 0) < stats.get("Web入口数量", 0):
+            failures.append(f"仍有 {visual_failed} 个 Web 入口页面识别失败")
+        if stats.get("Web入口数量", 0) and stats.get("已完成页面识别Web入口", 0) < stats.get("Web入口数量", 0):
             failures.append(f"Web 识别未全覆盖: {stats.get('Web识别覆盖率')}")
 
         high_gaps = [row for row in coverage_rows if row.get("缺口等级") == "高"]
@@ -148,6 +151,7 @@ class DeliveryQualityService:
                     warnings.append("Word报告缺少页眉")
                 if not doc.sections[0].footer.paragraphs[0].text.strip():
                     warnings.append("Word报告缺少页脚")
+                self._check_docx_renderability(report_path, warnings)
             except Exception as exc:
                 failures.append(f"Word报告无法打开: {str(exc)[:200]}")
         asset_path = paths["资产汇总附件"]
@@ -156,6 +160,44 @@ class DeliveryQualityService:
         web_path = paths["Web资产详情附件"]
         if web_path.exists() and web_path.stat().st_size > 0:
             self._check_workbook(web_path, EXPECTED_WEB_SHEETS, "Web资产详情附件", failures, warnings)
+
+    def _check_docx_renderability(self, report_path: Path, warnings: list[str]) -> None:
+        """Confirm that the generated Word document can be rendered to PDF.
+
+        Opening OOXML only proves that the ZIP/XML is readable.  LibreOffice
+        conversion catches a separate class of customer-facing defects such as
+        unsupported objects, damaged fonts, and invalid layout markup.  This is
+        intentionally a warning when LibreOffice is unavailable so ordinary
+        data processing is not blocked; formal delivery should use --strict.
+        """
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if not soffice:
+            warnings.append("未执行 Word 渲染检查：未检测到 LibreOffice；正式交付前请在可渲染环境复核版式")
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="assetmap-docx-render-") as temp_dir:
+                output_dir = Path(temp_dir) / "output"
+                profile_dir = Path(temp_dir) / "profile"
+                output_dir.mkdir()
+                profile_dir.mkdir()
+                command = [
+                    soffice,
+                    f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                    "--headless",
+                    "--norestore",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(output_dir),
+                    str(report_path),
+                ]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+                pdf_path = output_dir / f"{report_path.stem}.pdf"
+                if result.returncode != 0 or not pdf_path.exists() or pdf_path.stat().st_size <= 0:
+                    detail = (result.stderr or result.stdout or "未知转换错误").strip().replace("\n", " ")
+                    warnings.append(f"Word 渲染检查未通过：{detail[:200]}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            warnings.append(f"Word 渲染检查未完成：{str(exc)[:200]}")
 
     def _check_workbook(
         self,
@@ -203,19 +245,8 @@ class DeliveryQualityService:
         )
 
     def _check_web_workbook_contract(self, workbook, failures: list[str], warnings: list[str]) -> None:
-        sheet = workbook["截图证据"]
-        self._require_headers(sheet, {"缩略图", "截图文件", "截图状态"}, "Web资产详情附件/截图证据", failures)
-        headers = [cell.value for cell in sheet[1]]
-        status_column = headers.index("截图状态") + 1 if "截图状态" in headers else None
-        rows_with_screenshot = 0
-        if status_column:
-            rows_with_screenshot = sum(
-                1
-                for row_index in range(2, sheet.max_row + 1)
-                if sheet.cell(row=row_index, column=status_column).value == "有截图"
-            )
-        if rows_with_screenshot and not getattr(sheet, "_images", []):
-            warnings.append("Web资产详情附件截图证据存在截图路径但未嵌入缩略图")
+        sheet = workbook["HTML证据"]
+        self._require_headers(sheet, {"HTML文件", "HTML状态"}, "Web资产详情附件/HTML证据", failures)
 
     def _require_headers(self, sheet, required: set[str], label: str, failures: list[str]) -> None:
         headers = {cell.value for cell in sheet[1] if cell.value}
@@ -312,8 +343,8 @@ class DeliveryQualityService:
             manual_review_needed = True
         if any(row.get("环节") == "端口发现" and row.get("指标") == "端口证据来源质量" and row.get("缺口等级") in {"高", "中", "低"} for row in coverage_rows):
             actions.append(
-                f"端口台账存在仅被动FOFA证据；如需主动验证，可执行 assetmap nmap-scan {task.id} --sources nmap,fofa --rerun，"
-                "系统会优先精确验证已有 FOFA 端口；也可将 config.yaml 的 port_scan.sources_enabled 固化为 nmap+fofa。"
+                f"端口台账存在仅被动FOFA证据；可执行 assetmap nmap-scan {task.id} --rerun，"
+                "系统会串行精确验证已有 FOFA 端口并合并证据。"
             )
         service_gaps = [
             row
@@ -329,11 +360,11 @@ class DeliveryQualityService:
                 "复核服务识别台账中的 passive_fofa、疑似 Web 和未知服务项；仅当需要重新探测 Host、服务指纹或 URL 入口时再重跑 classify。"
             )
             manual_review_needed = True
-        if any(row.get("环节") == "URL视觉识别" and row.get("缺口等级") in {"高", "中", "低"} for row in coverage_rows):
+        if any(row.get("环节") == "URL页面识别" and row.get("缺口等级") in {"高", "中", "低"} for row in coverage_rows):
             if self._has_visual_retry_items(visual_review_rows):
-                actions.append(f"重试截图失败或缺失识别页面：assetmap url-discover {task.id} --retry-failed")
+                actions.append(f"重试页面渲染或识别失败入口：assetmap url-discover {task.id} --retry-failed")
             else:
-                actions.append("对视觉复核清单中的降级识别、低置信度、低价值错误/拦截页或疑似乱码页面进行人工核对；当前无自动重试项。")
+                actions.append("对页面识别复核清单中的降级识别、低置信度、低价值错误/拦截页或疑似乱码页面进行人工核对；当前无自动重试项。")
                 manual_review_needed = True
         if manual_review_needed:
             actions.append(

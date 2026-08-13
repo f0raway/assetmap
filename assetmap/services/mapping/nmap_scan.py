@@ -7,7 +7,6 @@ import re
 import shlex
 import subprocess
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -16,13 +15,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
-from assetmap.models import AiAnalysis, DnsRecord, NmapPort, NmapScanRun, NmapScanTask
+from assetmap.models import AiAnalysis, DnsRecord, NmapPort, NmapScanRun, NmapScanTask, OriginIpCandidate
 from assetmap.services.mapping.fofa import FofaClient, FofaPort
 from assetmap.services.runtime.tool_resolver import ToolResolver
+from assetmap.services.runtime.work_units import WorkUnitTracker
 
 
 NMAP_BATCH_TARGET = "__batch__"
+NMAP_PREFLIGHT_TARGET = "__preflight__"
+NMAP_TARGET_PREFIX = "__target__:"
 NMAP_FOFA_VALIDATION_PREFIX = "__fofa_validation__:"
+NMAP_SERVICE_DETECT_COMMAND = "{binary} -Pn -sV --version-intensity 5 -p {ports} {target} -oX {xml_output} -oN {normal_output}"
+NMAP_PROGRESS_INTERVAL = "15s"
+NMAP_SCRIPT_TIMEOUT = "60s"
+NMAP_PREFLIGHT_PORTS = (1, 22, 80, 443, 3306, 8080, 49152, 65535)
+NMAP_ACCEPT_ALL_MIN_OPEN_PORTS = 1024
+NMAP_ACCEPT_ALL_TCPWRAPPED_RATIO = 0.98
 PARKING_CNAME_KEYWORDS = ("expired.", "parking", "parked", "hichina.com")
 
 IP_PATTERN = re.compile(
@@ -103,8 +111,7 @@ class NmapScanService:
 
     def run(self, scan_task_id: int, rerun: bool = False) -> int:
         targets = self._targets(scan_task_id)
-        sources = self._sources()
-        self._log(f"[port] sources enabled: {', '.join(sorted(sources))}")
+        self._log("[port] fixed sources: nmap, fofa")
         task = self._get_or_create_task(scan_task_id)
         task.status = "running"
         task.started_at = task.started_at or _utcnow()
@@ -115,18 +122,10 @@ class NmapScanService:
         try:
             self._reset_stale_running_runs(scan_task_id)
             self._log(f"[port] targets: {len(targets)}")
-            if "nmap" not in sources:
-                self._run_fofa(scan_task_id, targets, rerun=rerun, required=True)
-                self._log_port_summary(scan_task_id)
-                task.status = "completed"
-                task.finished_at = _utcnow()
-                self.session.add(task)
-                self.session.commit()
-                return task.id
-            self._run_batch(scan_task_id, targets, rerun=rerun)
-            if "fofa" in sources:
-                self._run_fofa(scan_task_id, targets, rerun=rerun, required=False)
-            self._validate_fofa_ports(scan_task_id, targets, rerun=rerun)
+            active_targets = self._preflight_targets(scan_task_id, targets, rerun=rerun)
+            self._run_batch(scan_task_id, active_targets, rerun=rerun)
+            self._run_fofa(scan_task_id, targets, rerun=rerun)
+            self._validate_fofa_ports(scan_task_id, active_targets, rerun=rerun)
             self._log_port_summary(scan_task_id)
             task.status = "completed"
             task.finished_at = _utcnow()
@@ -149,15 +148,6 @@ class NmapScanService:
             self.session.commit()
             raise
 
-    def _sources(self) -> set[str]:
-        sources = {source.lower().strip() for source in self.config.port_scan.sources_enabled if source.strip()}
-        unsupported = sources - {"nmap", "fofa"}
-        if unsupported:
-            raise ValueError(f"Unsupported port scan sources: {', '.join(sorted(unsupported))}")
-        if not sources:
-            raise ValueError("No port scan sources enabled. Use port_scan.sources_enabled.")
-        return sources
-
     def _reset_stale_running_runs(self, scan_task_id: int) -> None:
         rows = self.session.exec(
             select(NmapScanRun).where(
@@ -173,24 +163,171 @@ class NmapScanService:
             self.session.commit()
 
     def _run_batch(self, scan_task_id: int, targets: list[str], rerun: bool = False) -> None:
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}"
+        """Run full-port scans as durable, serial, per-IP work units.
+
+        ``__batch__`` is retained only as historical audit evidence.  It is no
+        longer used for a new scan because an interrupted batch cannot tell us
+        which targets were actually finished.
+        """
+        output_dir = self.config.data_path("nmap", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
-        targets_file = output_dir / "ip.txt"
-        targets_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
-        run = self._get_or_create_batch_run(scan_task_id, targets_file, output_dir)
-        if run.status == "completed" and not rerun:
-            self._log(f"[nmap] skip completed batch scan: {targets_file}")
+        if not targets:
+            self._log("[nmap] full scan skipped: every target was flagged as TCP accept-all during preflight")
             return
-        if run.status == "running" and not rerun:
-            self._log("[nmap] skip running batch scan (use --rerun to restart)")
-            return
-        if (rerun or run.status == "failed") and run.status in {"completed", "failed", "running"}:
-            run.status = "pending"
-            self.session.add(run)
+        legacy = self.session.exec(
+            select(NmapScanRun).where(
+                NmapScanRun.scan_task_id == scan_task_id,
+                NmapScanRun.target_ip == NMAP_BATCH_TARGET,
+            )
+        ).first()
+        if legacy and legacy.status in {"interrupted", "failed", "running"}:
+            self._log(
+                "[nmap] detected an old interrupted batch record; it is retained for audit, "
+                "and recovery now continues per IP instead of restarting that batch"
+            )
+
+        tracker = WorkUnitTracker(self.session, scan_task_id, "port-scan")
+        self._log(f"[nmap] full-port scans serially: {len(targets)} independent IP jobs")
+        for index, target in enumerate(targets, start=1):
+            run = self._get_or_create_target_run(scan_task_id, target, output_dir, rerun=rerun)
+            target_dir = output_dir / "targets"
+            expected_command = self._scan_command(
+                target_dir / f"{_safe_ip(target)}.txt",
+                target_dir / f"{_safe_ip(target)}.xml",
+                target_dir / f"{_safe_ip(target)}.nmap",
+            )
+            input_payload = {"policy": "nmap-full-port-per-ip-v1", "target": target, "command": expected_command}
+            unit, changed = tracker.get_or_create(
+                "nmap_full_port",
+                target,
+                input_payload,
+            )
+            if unit.status == "completed" and not rerun and WorkUnitTracker.completed_output_exists(unit) and not changed:
+                self._log(f"[nmap] {index}/{len(targets)} skip completed: {target}")
+                continue
+            if unit.status == "completed" and not rerun and changed:
+                self._log(
+                    f"[nmap] {index}/{len(targets)} configuration changed after completed scan: {target}; "
+                    "keep saved result (use --rerun-ports to scan again)"
+                )
+                continue
+            if rerun:
+                unit.input_fingerprint = tracker.fingerprint(input_payload)
+                unit.status = "pending"
+                self.session.add(unit)
+                self.session.commit()
+            if run.status == "completed" and not rerun and Path(run.xml_output_path).exists():
+                tracker.complete(unit, output_path=run.xml_output_path, details={"nmap_run_id": run.id, "recovered": True})
+                self._log(f"[nmap] {index}/{len(targets)} reuse completed scan record: {target}")
+                continue
+            if run.status == "running":
+                run.status = "pending"
+                run.error_message = "Recovered from previous interrupted run"
+                self.session.add(run)
+                self.session.commit()
+            elif run.status in {"completed", "failed", "interrupted"}:
+                run.status = "pending"
+                self.session.add(run)
+                self.session.commit()
+            unit.input_fingerprint = tracker.fingerprint(input_payload)
+            self.session.add(unit)
             self.session.commit()
-        if run.id:
-            self._log(f"[nmap] batch scan with -iL {targets_file}")
-            self._run_one(run.id)
+            tracker.begin(unit)
+            self._log(f"[nmap] {index}/{len(targets)} scanning: {target}")
+            try:
+                self._run_one(run.id)
+            except KeyboardInterrupt:
+                tracker.fail(unit, "Interrupted by user", interrupted=True)
+                raise
+            self.session.expire_all()
+            saved_run = self.session.get(NmapScanRun, run.id) or run
+            if saved_run.status == "completed" and Path(saved_run.xml_output_path).exists():
+                tracker.complete(unit, output_path=saved_run.xml_output_path, details={"nmap_run_id": saved_run.id})
+            else:
+                tracker.fail(unit, saved_run.error_message or "Nmap did not produce a complete XML result")
+
+    def _preflight_targets(self, scan_task_id: int, targets: list[str], rerun: bool = False) -> list[str]:
+        """Exclude TCP accept-all responders before expensive full-port detection.
+
+        An IP that accepts connections on several widely separated ports is not
+        treated as a real all-port service host. It is preserved in the audit
+        for review, while FOFA can still supply passive evidence for that IP.
+        """
+        output_dir = self.config.data_path("nmap", f"task_{scan_task_id}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        targets_file = output_dir / "preflight_targets.txt"
+        targets_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
+        run = self._get_or_create_preflight_run(scan_task_id, targets_file, output_dir)
+        tracker = WorkUnitTracker(self.session, scan_task_id, "port-scan")
+        input_payload = {
+            "policy": "nmap-accept-all-preflight-v1",
+            "targets": targets,
+            "sentinel_ports": list(NMAP_PREFLIGHT_PORTS),
+            "command": run.command,
+        }
+        unit, changed = tracker.get_or_create("nmap_preflight", "all-targets", input_payload)
+        if unit.status == "completed" and not rerun and not changed and Path(run.xml_output_path).exists():
+            self._log("[nmap] preflight: reuse completed accept-all check")
+        else:
+            # A target-list change invalidates preflight output, but this is a
+            # deliberately tiny eight-port safety check, not a full rescan.
+            if run.status != "pending":
+                run.status = "pending"
+                self.session.add(run)
+                self.session.commit()
+            self._log(f"[nmap] preflight: checking {len(targets)} targets on {len(NMAP_PREFLIGHT_PORTS)} sentinel ports")
+            unit.input_fingerprint = tracker.fingerprint(input_payload)
+            self.session.add(unit)
+            self.session.commit()
+            tracker.begin(unit)
+            try:
+                self._run_one(run.id)
+            except KeyboardInterrupt:
+                tracker.fail(unit, "Interrupted by user", interrupted=True)
+                raise
+            self.session.expire_all()
+            run = self.session.get(NmapScanRun, run.id) or run
+            if run.status == "completed" and Path(run.xml_output_path).exists():
+                tracker.complete(unit, output_path=run.xml_output_path, details={"nmap_run_id": run.id})
+            else:
+                tracker.fail(unit, run.error_message or "Nmap preflight did not produce a complete XML result")
+        if run.status != "completed" or not Path(run.xml_output_path).exists():
+            self._log("[nmap] preflight unavailable; keeping all targets for the full scan")
+            return targets
+        suspicious = self._preflight_accept_all_targets(Path(run.xml_output_path))
+        self._write_port_anomaly_audit(
+            scan_task_id,
+            preflight={
+                "checked_targets": targets,
+                "sentinel_ports": list(NMAP_PREFLIGHT_PORTS),
+                "accept_all_targets": suspicious,
+                "active_scan_targets": [target for target in targets if target not in suspicious],
+            },
+        )
+        if suspicious:
+            self._log(
+                f"[nmap] preflight excluded {len(suspicious)} TCP accept-all targets; "
+                "they will not be represented as real open ports"
+            )
+            self._log(f"[nmap] preflight audit: {self._port_anomaly_audit_path(scan_task_id)}")
+        return [target for target in targets if target not in suspicious]
+
+    def _preflight_accept_all_targets(self, xml_path: Path) -> list[str]:
+        root = ET.parse(xml_path).getroot()
+        suspicious: list[str] = []
+        expected = set(NMAP_PREFLIGHT_PORTS)
+        for host in root.findall("host"):
+            target_ip = self._host_ip(host)
+            if not target_ip:
+                continue
+            open_ports = {
+                int(port.attrib.get("portid", "0"))
+                for port in host.findall("./ports/port")
+                if port.attrib.get("protocol") == "tcp" and (port.find("state") is not None and port.find("state").attrib.get("state") == "open")
+            }
+            if expected.issubset(open_ports):
+                suspicious.append(target_ip)
+        return sorted(set(suspicious))
 
     def _validate_fofa_ports(self, scan_task_id: int, targets: list[str], rerun: bool = False) -> None:
         ports_by_ip = self._fofa_ports_by_ip(scan_task_id, targets)
@@ -214,13 +351,10 @@ class NmapScanService:
                 jobs.append(run.id)
         if not jobs:
             return
-        workers = min(max(1, self.config.tools.nmap_max_workers), len(jobs))
         total_ports = sum(len(ports) for ports in ports_by_ip.values())
-        self._log(f"[nmap] validating FOFA passive ports: hosts={len(jobs)}, ports={total_ports}, workers={workers}")
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(self._run_one, run_id) for run_id in jobs]
-            for future in as_completed(futures):
-                future.result()
+        self._log(f"[nmap] validating FOFA passive ports serially: hosts={len(jobs)}, ports={total_ports}")
+        for run_id in jobs:
+            self._run_one(run_id)
 
     def _fofa_ports_by_ip(self, scan_task_id: int, targets: list[str]) -> dict[str, list[int]]:
         target_set = set(targets)
@@ -241,35 +375,75 @@ class NmapScanService:
                 output[row.target_ip].append(row.port)
         return {ip: sorted(ports) for ip, ports in sorted(output.items()) if ports}
 
-    def _run_fofa(self, scan_task_id: int, targets: list[str], rerun: bool = False, required: bool = False) -> None:
+    def _run_fofa(self, scan_task_id: int, targets: list[str], rerun: bool = False) -> None:
         client = FofaClient(self.config.fofa)
+        if hasattr(client, "set_progress"):
+            client.set_progress(self._log)
+        tracker = WorkUnitTracker(self.session, scan_task_id, "port-scan")
         total = 0
         attempted = 0
         errors: list[dict[str, str]] = []
         self._log(f"[fofa] passive port lookup targets: {len(targets)}")
-        for target in targets:
-            if not rerun and self._fofa_result_exists(scan_task_id, target):
-                self._log(f"[fofa] skip existing: {target}")
+        for index, target in enumerate(targets, start=1):
+            unit, changed = tracker.get_or_create(
+                "fofa_ip_lookup",
+                target,
+                {"policy": "fofa-ip-port-lookup-v1", "target": target},
+            )
+            # Records created before work-unit tracking prove that FOFA was
+            # queried successfully only when they contain at least one port.
+            # A historical empty response cannot be inferred, so it is queried
+            # once and then persisted as a completed zero-result unit.
+            if unit.attempts == 0 and unit.status == "pending" and self._fofa_result_exists(scan_task_id, target):
+                tracker.complete(unit, details={"migrated_from_port_evidence": True})
+                unit = self.session.get(type(unit), unit.id) or unit
+            if unit.status == "completed" and not rerun and not changed:
+                ports_count = (unit.details or {}).get("ports_returned", 0)
+                self._log(f"[fofa] {index}/{len(targets)} skip completed: {target}, ports={ports_count}")
                 continue
+            if unit.status == "completed" and not rerun and changed:
+                self._log(
+                    f"[fofa] {index}/{len(targets)} lookup policy changed: {target}; "
+                    "keep saved result (use --rerun-ports to query again)"
+                )
+                continue
+            if rerun:
+                unit.input_fingerprint = tracker.fingerprint({"policy": "fofa-ip-port-lookup-v1", "target": target})
+                unit.status = "pending"
+                self.session.add(unit)
+                self.session.commit()
             attempted += 1
+            self._log(f"[fofa] {index}/{len(targets)} querying: {target}")
+            unit.input_fingerprint = tracker.fingerprint({"policy": "fofa-ip-port-lookup-v1", "target": target})
+            self.session.add(unit)
+            self.session.commit()
+            tracker.begin(unit)
             try:
                 ports = client.search_ip_ports(target)
             except Exception as exc:
-                message = str(exc)[:500]
+                message = self._safe_fofa_error(exc)
+                tracker.fail(unit, message)
                 errors.append({"target": target, "error": message})
-                self._log(f"[fofa] {target}: failed -> {message[:160]}")
+                self._log(f"[fofa] {index}/{len(targets)} failed: {target} -> {message[:160]}")
                 continue
-            self._log(f"[fofa] {target}: {len(ports)} ports")
+            self._log(f"[fofa] {index}/{len(targets)} done: {target}, ports={len(ports)}")
             total += self._save_fofa_ports(scan_task_id, ports)
+            tracker.complete(unit, details={"ports_returned": len(ports)})
         if errors:
             error_path = self._write_fofa_errors(scan_task_id, errors)
             self._log(f"[fofa] failures: {len(errors)}/{attempted}, details={error_path}")
-            if required and attempted and len(errors) == attempted and total == 0:
-                raise RuntimeError(f"FOFA passive lookup failed for all targets. See {error_path}")
         self._log(f"[fofa] passive ports merged: {total}")
 
+    def _safe_fofa_error(self, exc: Exception) -> str:
+        """Keep failures useful without ever persisting an API query URL or Key."""
+        message = str(exc)
+        message = message.replace(self.config.fofa.api_key, "[REDACTED_SECRET]")
+        message = message.replace(self.config.fofa.email, "[REDACTED_EMAIL]")
+        message = re.sub(r"https?://\S+", "[FOFA_REQUEST_URL_REDACTED]", message)
+        return message[:500]
+
     def _write_fofa_errors(self, scan_task_id: int, errors: list[dict[str, str]]) -> Path:
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("nmap", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "fofa_errors.json"
         payload = {
@@ -371,28 +545,27 @@ class NmapScanService:
 
     def _targets(self, scan_task_id: int) -> list[str]:
         by_source = self._targets_by_source(scan_task_id)
-        enabled_sources = self._target_sources()
         targets: list[str] = []
-        for source in enabled_sources:
+        for source in ("origin_confirmed", "manual_confirmed"):
             for value in by_source[source]:
                 if value not in targets:
                     targets.append(value)
         self._log(
             "[port] target sources: "
-            + ", ".join(f"{source}={len(by_source[source])}" for source in enabled_sources)
+            + ", ".join(f"{source}={len(by_source[source])}" for source in ("origin_confirmed", "manual_confirmed"))
             + f", merged={len(targets)}"
         )
         manifest = self._write_target_sources_manifest(scan_task_id, by_source, targets)
         self._log(f"[port] target source manifest: {manifest}")
         if not targets:
             raise ValueError(
-                "No port scan target IPs found. Run subdomains, enable DNS/AI target sources, "
-                "or import manual IPs first."
+                "No confirmed origin IPs found. Run domain mapping and review its candidates, "
+                "or import a manual IP first."
             )
         return targets
 
     def _write_target_sources_manifest(self, scan_task_id: int, by_source: dict[str, list[str]], targets: list[str]) -> Path:
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("nmap", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         sources_by_ip: dict[str, list[str]] = {}
         for source, values in by_source.items():
@@ -403,7 +576,7 @@ class NmapScanService:
         payload = {
             "scan_task_id": scan_task_id,
             "generated_at": _utcnow().isoformat(),
-            "target_sources_enabled": self._target_sources(),
+            "selection_policy": "only origin_ip_candidates decision=include or manual_confirmed",
             "source_counts": {source: len(values) for source, values in by_source.items()},
             "merged_count": len(targets),
             "merged_targets": targets,
@@ -414,88 +587,30 @@ class NmapScanService:
         return path
 
     def _targets_by_source(self, scan_task_id: int) -> dict[str, list[str]]:
-        all_sources = {
-            "ai": self._targets_from_ai(scan_task_id),
-            "manual": self._targets_from_manual_ips(scan_task_id),
-            "dns_public": self._targets_from_dns_public(scan_task_id),
-        }
-        return {source: all_sources[source] for source in self._target_sources()}
-
-    def _target_sources(self) -> list[str]:
-        sources = [source.lower().strip() for source in self.config.port_scan.target_sources_enabled if source.strip()]
-        unsupported = set(sources) - {"ai", "manual", "dns_public"}
-        if unsupported:
-            raise ValueError(f"Unsupported port scan target sources: {', '.join(sorted(unsupported))}")
-        if not sources:
-            raise ValueError("No port scan target sources enabled. Use port_scan.target_sources_enabled.")
-        return sources
-
-    def _targets_from_ai(self, scan_task_id: int) -> list[str]:
         rows = self.session.exec(
-            select(AiAnalysis).where(
-                AiAnalysis.scan_task_id == scan_task_id,
-                AiAnalysis.status == "completed",
-                AiAnalysis.analysis_type == "dns_inference",
+            select(OriginIpCandidate).where(
+                OriginIpCandidate.scan_task_id == scan_task_id,
+                OriginIpCandidate.decision.in_(["include", "manual_confirmed"]),
             )
         ).all()
-        targets: list[str] = []
+        output = {"origin_confirmed": [], "manual_confirmed": []}
         for row in rows:
-            for value in extract_ai_marked_service_ips(row.summary or ""):
-                if value not in targets:
-                    targets.append(value)
-        return targets
-
-    def _targets_from_manual_ips(self, scan_task_id: int) -> list[str]:
-        rows = self.session.exec(
+            if not _is_real_public_ip(row.ip):
+                continue
+            source = "manual_confirmed" if row.decision == "manual_confirmed" else "origin_confirmed"
+            output[source].append(row.ip)
+        # A manual IP may be added after domain mapping. It is an explicit user
+        # confirmation, so it can enter the remaining stages immediately.
+        manual_rows = self.session.exec(
             select(DnsRecord).where(
                 DnsRecord.scan_task_id == scan_task_id,
                 DnsRecord.record_type.in_(["A", "AAAA"]),
             )
         ).all()
-        targets: list[str] = []
-        for row in rows:
-            if (row.raw_payload or {}).get("kind") != "manual_ip":
-                continue
-            if _is_real_public_ip(row.value) and row.value not in targets:
-                targets.append(row.value)
-        return targets
-
-    def _targets_from_dns_public(self, scan_task_id: int) -> list[str]:
-        rows = self.session.exec(
-            select(DnsRecord).where(
-                DnsRecord.scan_task_id == scan_task_id,
-            )
-        ).all()
-        parked_hosts = {
-            row.fqdn
-            for row in rows
-            if row.record_type == "CNAME" and self._is_parking_cname(row.value)
-        }
-        external_cname_hosts = {
-            row.fqdn
-            for row in rows
-            if row.record_type == "CNAME" and not self._is_same_root_cname(row.value, row.root_domain)
-        }
-        targets: list[str] = []
-        for row in rows:
-            if row.record_type not in {"A", "AAAA"}:
-                continue
-            if (row.raw_payload or {}).get("kind") == "manual_ip":
-                continue
-            if row.fqdn in parked_hosts or row.fqdn in external_cname_hosts:
-                continue
-            if _is_real_public_ip(row.value) and row.value not in targets:
-                targets.append(row.value)
-        return targets
-
-    def _is_parking_cname(self, value: str) -> bool:
-        text = value.lower().rstrip(".")
-        return any(keyword in text for keyword in PARKING_CNAME_KEYWORDS)
-
-    def _is_same_root_cname(self, value: str, root_domain: str) -> bool:
-        cname = value.lower().rstrip(".")
-        root = root_domain.lower().rstrip(".")
-        return cname == root or cname.endswith(f".{root}")
+        for row in manual_rows:
+            if (row.raw_payload or {}).get("kind") == "manual_ip" and _is_real_public_ip(row.value):
+                output["manual_confirmed"].append(row.value)
+        return {name: sorted(set(values)) for name, values in output.items()}
 
     def _get_or_create_task(self, scan_task_id: int) -> NmapScanTask:
         task = self.session.exec(
@@ -510,7 +625,7 @@ class NmapScanService:
         return task
 
     def _binary_path(self) -> str:
-        executable = ToolResolver(self.config.tools).nmap_executable()
+        executable = ToolResolver(self.config.tools, self.config.config_dir).nmap_executable()
         if not executable:
             raise ValueError(
                 "nmap executable not found. Install Nmap manually and ensure it is in PATH, "
@@ -522,19 +637,43 @@ class NmapScanService:
         template = self.config.tools.nmap_command
         if "{" not in template and "%s" in template:
             values = [_quote(str(targets_file)), _quote(str(xml_output)), _quote(str(normal_output))]
-            return template % tuple(values[: template.count("%s")])
-        return template.format(
-            binary=_quote(self._binary_path()),
-            targets_file=_quote(str(targets_file)),
-            target_file=_quote(str(targets_file)),
-            xml_output=_quote(str(xml_output)),
-            normal_output=_quote(str(normal_output)),
-            output_dir=_quote(str(xml_output.parent)),
+            command = template % tuple(values[: template.count("%s")])
+        else:
+            command = template.format(
+                binary=_quote(self._binary_path()),
+                targets_file=_quote(str(targets_file)),
+                target_file=_quote(str(targets_file)),
+                xml_output=_quote(str(xml_output)),
+                normal_output=_quote(str(normal_output)),
+                output_dir=_quote(str(xml_output.parent)),
+            )
+        return self._ensure_service_version_detection(command)
+
+    def _preflight_command(self, targets_file: Path, xml_output: Path, normal_output: Path) -> str:
+        ports = ",".join(str(port) for port in NMAP_PREFLIGHT_PORTS)
+        return (
+            f"{_quote(self._binary_path())} -Pn -n --open --reason --max-retries 1 "
+            f"-p {ports} -iL {_quote(str(targets_file))} "
+            f"-oX {_quote(str(xml_output))} -oN {_quote(str(normal_output))} "
+            f"--stats-every {NMAP_PROGRESS_INTERVAL}"
         )
 
+    @staticmethod
+    def _ensure_service_version_detection(command: str) -> str:
+        """Guarantee service evidence and periodic Nmap progress output."""
+        if re.search(r"(?:^|\s)-sV(?:\s|$)", command) or "--service-version" in command:
+            with_service_detection = command
+        else:
+            with_service_detection = f"{command} -sV --version-intensity 5"
+        if "--script-timeout" not in with_service_detection:
+            with_service_detection = f"{with_service_detection} --script-timeout {NMAP_SCRIPT_TIMEOUT}"
+        if "--stats-every" not in with_service_detection:
+            with_service_detection = f"{with_service_detection} --stats-every {NMAP_PROGRESS_INTERVAL}"
+        return with_service_detection
+
     def _service_detect_command(self, target: str, ports: list[int], xml_output: Path, normal_output: Path) -> str:
-        template = self.config.tools.nmap_service_detect_command
-        return template.format(
+        template = NMAP_SERVICE_DETECT_COMMAND
+        command = template.format(
             binary=_quote(self._binary_path()),
             target=_quote(target),
             ports=",".join(str(port) for port in sorted(set(ports))),
@@ -542,6 +681,7 @@ class NmapScanService:
             normal_output=_quote(str(normal_output)),
             output_dir=_quote(str(xml_output.parent)),
         )
+        return self._ensure_service_version_detection(command)
 
     def _get_or_create_batch_run(self, scan_task_id: int, targets_file: Path, output_dir: Path) -> NmapScanRun:
         xml_output = output_dir / "nmap.xml"
@@ -574,8 +714,84 @@ class NmapScanService:
         self.session.refresh(run)
         return run
 
+    def _get_or_create_target_run(
+        self,
+        scan_task_id: int,
+        target: str,
+        output_dir: Path,
+        *,
+        rerun: bool = False,
+    ) -> NmapScanRun:
+        """Return the Nmap record for one IP without rewriting a saved run."""
+        target_dir = output_dir / "targets"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / f"{_safe_ip(target)}.txt"
+        target_file.write_text(f"{target}\n", encoding="utf-8")
+        xml_output = target_dir / f"{_safe_ip(target)}.xml"
+        normal_output = target_dir / f"{_safe_ip(target)}.nmap"
+        command = self._scan_command(target_file, xml_output, normal_output)
+        target_key = f"{NMAP_TARGET_PREFIX}{target}"
+        run = self.session.exec(
+            select(NmapScanRun).where(
+                NmapScanRun.scan_task_id == scan_task_id,
+                NmapScanRun.target_ip == target_key,
+            )
+        ).first()
+        if run:
+            # A completed command is historical evidence.  Do not silently
+            # replace it after a config edit; --rerun-ports is explicit intent.
+            if rerun or run.status != "completed":
+                run.command = command
+                run.xml_output_path = str(xml_output)
+                run.normal_output_path = str(normal_output)
+                self.session.add(run)
+                self.session.commit()
+            return run
+        run = NmapScanRun(
+            scan_task_id=scan_task_id,
+            target_ip=target_key,
+            command=command,
+            xml_output_path=str(xml_output),
+            normal_output_path=str(normal_output),
+        )
+        self.session.add(run)
+        self.session.commit()
+        self.session.refresh(run)
+        return run
+
+    def _get_or_create_preflight_run(self, scan_task_id: int, targets_file: Path, output_dir: Path) -> NmapScanRun:
+        xml_output = output_dir / "preflight.xml"
+        normal_output = output_dir / "preflight.txt"
+        command = self._preflight_command(targets_file, xml_output, normal_output)
+        run = self.session.exec(
+            select(NmapScanRun).where(
+                NmapScanRun.scan_task_id == scan_task_id,
+                NmapScanRun.target_ip == NMAP_PREFLIGHT_TARGET,
+            )
+        ).first()
+        if run:
+            if run.command != command:
+                run.status = "pending"
+            run.command = command
+            run.xml_output_path = str(xml_output)
+            run.normal_output_path = str(normal_output)
+            self.session.add(run)
+            self.session.commit()
+            return run
+        run = NmapScanRun(
+            scan_task_id=scan_task_id,
+            target_ip=NMAP_PREFLIGHT_TARGET,
+            command=command,
+            xml_output_path=str(xml_output),
+            normal_output_path=str(normal_output),
+        )
+        self.session.add(run)
+        self.session.commit()
+        self.session.refresh(run)
+        return run
+
     def _get_or_create_fofa_validation_run(self, scan_task_id: int, target: str, ports: list[int]) -> NmapScanRun:
-        output_dir = Path("data") / "nmap" / f"task_{scan_task_id}" / "fofa_validation"
+        output_dir = self.config.data_path("nmap", f"task_{scan_task_id}", "fofa_validation")
         output_dir.mkdir(parents=True, exist_ok=True)
         port_key = "_".join(str(port) for port in sorted(set(ports)))[:120]
         xml_output = output_dir / f"{_safe_ip(target)}_{port_key}.xml"
@@ -621,33 +837,54 @@ class NmapScanService:
             session.commit()
             target_label = self._display_target(run.target_ip)
             self._log(f"[nmap] scan {target_label}")
+            process: subprocess.Popen[str] | None = None
             try:
-                proc = subprocess.run(
+                process = subprocess.Popen(
                     run.command,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=self.config.tools.nmap_timeout_seconds,
+                    bufsize=1,
                 )
-                run.exit_code = proc.returncode
-                run.stdout = proc.stdout[-20000:]
-                run.stderr = proc.stderr[-20000:]
-                run.status = "completed" if proc.returncode == 0 else "failed"
-                if proc.returncode != 0:
-                    run.error_message = proc.stderr[-2000:] or proc.stdout[-2000:]
+                self._log(f"[nmap] {target_label}: running; progress is printed every {NMAP_PROGRESS_INTERVAL}")
+                output_lines: list[str] = []
+                if process.stdout:
+                    for line in process.stdout:
+                        output_lines.append(line)
+                        text_line = line.strip()
+                        if text_line:
+                            self._log(f"[nmap] {target_label} | {text_line}")
+                        run.stdout = "".join(output_lines)[-20000:]
+                        session.add(run)
+                        session.commit()
+                return_code = process.wait()
+                run.exit_code = return_code
+                run.stdout = "".join(output_lines)[-20000:]
+                run.stderr = ""
+                run.status = "completed" if return_code == 0 else "failed"
+                if return_code != 0:
+                    run.error_message = run.stdout[-2000:]
                 if Path(run.xml_output_path).exists():
                     try:
                         self._parse_xml(session, run)
                     except ET.ParseError as exc:
                         run.error_message = f"nmap XML parse failed: {exc}; text output retained"
-            except subprocess.TimeoutExpired as exc:
-                run.status = "failed"
-                run.exit_code = -1
-                run.stdout = (exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else ""
-                run.stderr = (exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else ""
-                run.error_message = f"nmap timed out after {self.config.tools.nmap_timeout_seconds}s"
+            except KeyboardInterrupt:
+                if process and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                run.status = "interrupted"
+                run.error_message = "Interrupted by user"
+                run.finished_at = _utcnow()
+                session.add(run)
+                session.commit()
+                raise
             except Exception as exc:
                 run.status = "failed"
                 run.error_message = str(exc)
@@ -657,7 +894,12 @@ class NmapScanService:
 
     def _parse_xml(self, session: Session, run: NmapScanRun) -> None:
         root = ET.parse(run.xml_output_path).getroot()
+        if run.target_ip == NMAP_PREFLIGHT_TARGET:
+            # Preflight only decides whether a target can safely enter the full
+            # scan. Its eight sentinel ports are not asset evidence.
+            return
         validation_target = self._fofa_validation_target(run.target_ip)
+        full_scan_target = self._full_scan_target(run.target_ip)
         if run.target_ip == NMAP_BATCH_TARGET:
             existing = session.exec(
                 select(NmapPort).where(NmapPort.scan_task_id == run.scan_task_id)
@@ -666,7 +908,7 @@ class NmapScanService:
             existing = session.exec(
                 select(NmapPort).where(
                     NmapPort.scan_task_id == run.scan_task_id,
-                    NmapPort.target_ip == (validation_target or run.target_ip),
+                    NmapPort.target_ip == (validation_target or full_scan_target or run.target_ip),
                 )
             ).all()
         if not validation_target:
@@ -677,17 +919,29 @@ class NmapScanService:
         hosts = root.findall("host")
         if hosts:
             for host in hosts:
-                target_ip = self._host_ip(host) or validation_target or run.target_ip
+                target_ip = self._host_ip(host) or validation_target or full_scan_target or run.target_ip
                 self._parse_host_ports(session, run.scan_task_id, target_ip, host.findall("./ports/port"))
             return
-        self._parse_host_ports(session, run.scan_task_id, validation_target or run.target_ip, root.findall(".//port"))
+        self._parse_host_ports(
+            session,
+            run.scan_task_id,
+            validation_target or full_scan_target or run.target_ip,
+            root.findall(".//port"),
+        )
 
     def _fofa_validation_target(self, value: str) -> str | None:
         return value[len(NMAP_FOFA_VALIDATION_PREFIX):] if value.startswith(NMAP_FOFA_VALIDATION_PREFIX) else None
 
+    def _full_scan_target(self, value: str) -> str | None:
+        return value[len(NMAP_TARGET_PREFIX):] if value.startswith(NMAP_TARGET_PREFIX) else None
+
     def _display_target(self, value: str) -> str:
+        if value == NMAP_PREFLIGHT_TARGET:
+            return "preflight"
         target = self._fofa_validation_target(value)
-        return f"{target} (FOFA ports)" if target else value
+        if target:
+            return f"{target} (FOFA ports)"
+        return self._full_scan_target(value) or value
 
     def _host_ip(self, host: ET.Element) -> str | None:
         for address in host.findall("address"):
@@ -703,6 +957,36 @@ class NmapScanService:
         target_ip: str,
         ports: list[ET.Element],
     ) -> None:
+        if self._is_tcp_accept_all_response(ports):
+            self._remove_active_port_evidence(session, scan_task_id, target_ip)
+            self._write_port_anomaly_audit(
+                scan_task_id,
+                parser_fallback={
+                    "target_ip": target_ip,
+                    "open_tcp_ports": sum(
+                        1
+                        for port in ports
+                        if port.attrib.get("protocol") == "tcp"
+                        and port.find("state") is not None
+                        and port.find("state").attrib.get("state") == "open"
+                    ),
+                    "tcpwrapped_ports": sum(
+                        1
+                        for port in ports
+                        if port.attrib.get("protocol") == "tcp"
+                        and port.find("state") is not None
+                        and port.find("state").attrib.get("state") == "open"
+                        and port.find("service") is not None
+                        and port.find("service").attrib.get("name") == "tcpwrapped"
+                    ),
+                    "reason": "full_port_tcpwrapped_pattern",
+                },
+            )
+            self._log(
+                f"[nmap] abnormal TCP accept-all response: {target_ip}; "
+                "discarded active all-port result and retained the audit evidence"
+            )
+            return
         for port in ports:
             state_el = port.find("state")
             service_el = port.find("service")
@@ -757,3 +1041,74 @@ class NmapScanService:
                 session.commit()
             except IntegrityError:
                 session.rollback()
+
+    @staticmethod
+    def _is_tcp_accept_all_response(ports: list[ET.Element]) -> bool:
+        open_tcp = [
+            port
+            for port in ports
+            if port.attrib.get("protocol") == "tcp"
+            and port.find("state") is not None
+            and port.find("state").attrib.get("state") == "open"
+        ]
+        if len(open_tcp) < NMAP_ACCEPT_ALL_MIN_OPEN_PORTS:
+            return False
+        tcpwrapped = sum(
+            1
+            for port in open_tcp
+            if port.find("service") is not None and port.find("service").attrib.get("name") == "tcpwrapped"
+        )
+        return tcpwrapped / len(open_tcp) >= NMAP_ACCEPT_ALL_TCPWRAPPED_RATIO
+
+    def _remove_active_port_evidence(self, session: Session, scan_task_id: int, target_ip: str) -> None:
+        rows = session.exec(
+            select(NmapPort).where(
+                NmapPort.scan_task_id == scan_task_id,
+                NmapPort.target_ip == target_ip,
+            )
+        ).all()
+        for row in rows:
+            if not self._is_fofa_port(row):
+                session.delete(row)
+        session.commit()
+
+    def _port_anomaly_audit_path(self, scan_task_id: int) -> Path:
+        return self.config.data_path("nmap", f"task_{scan_task_id}", "port_anomaly_audit.json")
+
+    def _write_port_anomaly_audit(
+        self,
+        scan_task_id: int,
+        *,
+        preflight: dict | None = None,
+        parser_fallback: dict | None = None,
+    ) -> Path:
+        path = self._port_anomaly_audit_path(scan_task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict = {}
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        payload.update(
+            {
+                "scan_task_id": scan_task_id,
+                "generated_at": _utcnow().isoformat(),
+                "policy": {
+                    "preflight_sentinel_ports": list(NMAP_PREFLIGHT_PORTS),
+                    "preflight_rule": "all sentinel ports open",
+                    "parser_fallback_min_open_tcp_ports": NMAP_ACCEPT_ALL_MIN_OPEN_PORTS,
+                    "parser_fallback_min_tcpwrapped_ratio": NMAP_ACCEPT_ALL_TCPWRAPPED_RATIO,
+                    "handling": "do not store active all-port results as assets; retain passive FOFA evidence only",
+                },
+            }
+        )
+        if preflight is not None:
+            payload["preflight"] = preflight
+        if parser_fallback is not None:
+            fallback = list(payload.get("parser_fallback") or [])
+            if parser_fallback not in fallback:
+                fallback.append(parser_fallback)
+            payload["parser_fallback"] = fallback
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path

@@ -15,7 +15,7 @@ def test_install_tools_empty_list_defaults_to_all(monkeypatch):
     monkeypatch.setattr(ToolInstallService, "_install_nmap", lambda self, platform_info: called.append("nmap") or True)
 
     assert ToolInstallService().run([]) is True
-    assert called == ["subfinder", "dnsx", "nmap"]
+    assert called == ["subfinder", "dnsx", "nmap", "httpx"]
 
 
 def test_download_urls_match_release_asset_names():
@@ -28,6 +28,10 @@ def test_download_urls_match_release_asset_names():
     assert service._download_url(TOOL_DOWNLOADS["dnsx"], "macOS_arm64") == (
         "https://github.com/projectdiscovery/dnsx/releases/download/"
         "v1.2.2/dnsx_1.2.2_macOS_arm64.zip"
+    )
+    assert service._download_url(TOOL_DOWNLOADS["httpx"], "macOS_arm64") == (
+        "https://github.com/projectdiscovery/httpx/releases/download/"
+        "v1.10.0/httpx_1.10.0_macOS_arm64.zip"
     )
 
 

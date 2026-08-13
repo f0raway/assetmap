@@ -52,6 +52,20 @@ TOOL_DOWNLOADS = {
         },
         "extract": "dnsx",
     },
+    "httpx": {
+        "repo": "projectdiscovery/httpx",
+        "tag": "v1.10.0",
+        "version": "1.10.0",
+        "url_template": "https://github.com/projectdiscovery/httpx/releases/download/{tag}/httpx_{version}_{platform}.zip",
+        "platforms": {
+            "darwin_arm64": "macOS_arm64",
+            "darwin_amd64": "macOS_amd64",
+            "linux_amd64": "linux_amd64",
+            "linux_arm64": "linux_arm64",
+            "windows_amd64": "windows_amd64",
+        },
+        "extract": "httpx",
+    },
 }
 
 
@@ -105,7 +119,7 @@ class ToolInstallService:
         self._log("")
 
         if not tools:
-            tools = ["subfinder", "dnsx", "nmap"]
+            tools = ["subfinder", "dnsx", "nmap", "httpx"]
 
         success_count = 0
         for tool_name in tools:
@@ -295,9 +309,10 @@ class ToolInstallService:
                 return False
 
         elif system == "windows":
-            # Windows: 提示下载安装
+            # Windows: Nmap is installed system-wide rather than bundled in
+            # the source repository, so keep the guidance aligned with the
+            # supported installer source.
             self._log("  请下载安装包: https://nmap.org/download.html")
-            self._log("  或运行: tools/nmap/nmap-7.99-setup.exe")
             return False
 
         return False

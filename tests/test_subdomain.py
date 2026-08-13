@@ -6,7 +6,7 @@ from sqlmodel import select
 
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.models import AiAnalysis, Company, CompanyAssetLink, DnsQueryStatus, DnsRecord, InternetAsset, SubdomainRecord, SubdomainToolRun
+from assetmap.models import AiAnalysis, Company, CompanyAssetLink, DnsQueryStatus, DnsRecord, InternetAsset, OriginIpCandidate, SubdomainEnumerationTask, SubdomainRecord, SubdomainToolRun
 from assetmap.services.mapping.nmap_scan import extract_ai_marked_service_ips
 from assetmap.services.mapping.subdomain import (
     SubdomainService,
@@ -41,6 +41,15 @@ def test_clear_dns_results_removes_records_and_statuses(tmp_path: Path):
     assert session.exec(select(DnsQueryStatus)).all() == []
 
 
+def test_domain_mapping_rejects_missing_scan_task(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+
+    with __import__("pytest").raises(ValueError, match="Scan task 99 not found"):
+        SubdomainService(session, config).run(99)
+
+
 def test_dns_ai_analysis_uses_cache_when_payload_unchanged(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.ai.enabled = True
@@ -52,6 +61,7 @@ def test_dns_ai_analysis_uses_cache_when_payload_unchanged(tmp_path: Path):
     }
     session.add(DnsRecord(scan_task_id=1, fqdn="example.cn", root_domain="example.cn", record_type="A", value="8.8.8.8"))
     session.commit()
+    service._build_origin_candidates(1)
 
     service._run_ai_analysis(1)
     service._call_ai = lambda ai_config, payload: (_ for _ in ()).throw(AssertionError("should use cache"))  # type: ignore[method-assign]
@@ -62,31 +72,32 @@ def test_dns_ai_analysis_uses_cache_when_payload_unchanged(tmp_path: Path):
     assert row.prompt_json["fingerprint"]
 
 
-def test_dns_ai_analysis_batches_and_merges_targets(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("assetmap.services.mapping.subdomain.DNS_AI_BATCH_MAX_RECORDS", 1)
+def test_dns_ai_analysis_only_approves_high_confidence_candidates(tmp_path: Path, monkeypatch):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     config.ai.enabled = True
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     service = SubdomainService(session, config)
-    calls: list[list[str]] = []
+    calls: list[dict] = []
 
     def fake_call(_ai_config, payload):
-        calls.append(payload["dns_records"])
-        ip = payload["dns_records"][0].split("|")[-1]
-        return {"choices": [{"message": {"content": f"NMAP_TARGET_IPS\n- {ip} | high | test\nEND_NMAP_TARGET_IPS"}}]}
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "ORIGIN_IP_DECISIONS\n- 8.8.8.8 | include | high | direct\nEND_ORIGIN_IP_DECISIONS"}}]}
 
     service._call_ai = fake_call  # type: ignore[method-assign]
     session.add(DnsRecord(scan_task_id=1, fqdn="a.example.cn", root_domain="example.cn", record_type="A", value="8.8.8.8"))
     session.add(DnsRecord(scan_task_id=1, fqdn="b.example.cn", root_domain="example.cn", record_type="A", value="1.1.1.1"))
     session.commit()
+    service._build_origin_candidates(1)
 
     service._run_ai_analysis(1)
 
     row = session.exec(select(AiAnalysis).where(AiAnalysis.analysis_type == "dns_inference")).one()
-    assert len(calls) == 2
-    assert row.prompt_json["batch_count"] == 2
-    assert sorted(extract_ai_marked_service_ips(row.summary or "")) == ["1.1.1.1", "8.8.8.8"]
+    assert len(calls) == 1
+    assert row.prompt_json["schema_version"] == 4
+    candidates = {item.ip: item for item in session.exec(select(OriginIpCandidate)).all()}
+    assert candidates["8.8.8.8"].decision == "include"
+    assert candidates["1.1.1.1"].decision == "exclude"
 
 
 def test_root_domains_are_longest_first_for_specific_matching(tmp_path: Path):
@@ -158,9 +169,9 @@ def test_subdomain_command_quotes_domain_values(tmp_path: Path):
         assert '"example.cn & unexpected"' in command
 
 
-def test_parse_dnsx_skips_large_output_and_removes_pollution(tmp_path: Path):
+def test_parse_dnsx_skips_large_output_and_removes_pollution(tmp_path: Path, monkeypatch):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.tools.subdomain_tool_max_output_lines = 2
+    monkeypatch.setattr("assetmap.services.mapping.subdomain.SUBDOMAIN_OUTPUT_MAX_LINES", 2)
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     output = tmp_path / "dnsx.txt"
@@ -215,7 +226,6 @@ def test_subdomain_tool_summary_logs_failures(tmp_path: Path):
 
 def test_subdomain_tool_summary_ignores_disabled_tools(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.tools.subdomain_tools_enabled = ["subfinder", "dnsx"]
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     session.add(SubdomainToolRun(scan_task_id=1, root_domain="example.cn", tool_name="subfinder", command="", output_path="", status="completed"))
@@ -241,7 +251,36 @@ def test_subfinder_provider_hint_only_appears_when_subfinder_is_enabled(tmp_path
     service._log_subfinder_provider_hint([("subfinder", "")])
     assert len(logs) == 2
     assert "provider API Key" in logs[0]
-    assert "SUBFINDER_PROVIDER_CONFIG" in logs[1]
+    assert "-pc" in logs[1]
+
+
+def test_subdomain_audit_separates_normal_no_record_from_dns_failure(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(DnsQueryStatus(scan_task_id=1, fqdn="empty.example.cn", root_domain="example.cn", record_type="AAAA", status="completed", error_message="DoH no AAAA answer"))
+    session.add(DnsQueryStatus(scan_task_id=1, fqdn="broken.example.cn", root_domain="example.cn", record_type="A", status="failed", error_message="timeout"))
+    session.commit()
+
+    path = SubdomainService(session, config)._write_subdomain_audit(1, ["example.cn"])
+    payload = __import__("json").loads(path.read_text(encoding="utf-8"))
+
+    assert payload["no_record_dns_query_count"] == 1
+    assert payload["failed_dns_query_count"] == 1
+
+
+def test_ai_failure_reports_retryable_gap(tmp_path: Path, monkeypatch):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+    session.add(OriginIpCandidate(scan_task_id=1, ip="8.8.8.8", decision="pending_ai"))
+    session.commit()
+    monkeypatch.setattr(service, "_call_ai", lambda *_args: (_ for _ in ()).throw(RuntimeError("gateway unavailable")))
+
+    assert service._run_ai_analysis(1) is False
+    assert service._last_ai_error == "gateway unavailable"
 
 
 def test_interrupted_tool_run_is_detected(tmp_path: Path):
@@ -266,7 +305,6 @@ def test_interrupted_tool_run_is_detected(tmp_path: Path):
 def test_failed_tool_run_is_retried_by_normal_resume(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
-    config.tools.subdomain_tools_enabled = ["subfinder"]
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     run = SubdomainToolRun(
@@ -287,7 +325,7 @@ def test_failed_tool_run_is_retried_by_normal_resume(tmp_path: Path, monkeypatch
 
     service._run_enumerators(1, ["example.cn"])
 
-    assert called == [run.id]
+    assert run.id in called
     assert session.get(SubdomainToolRun, run.id).status == "pending"
 
 
@@ -331,7 +369,7 @@ def test_dns_coverage_summary_logs_gaps(tmp_path: Path):
 
     SubdomainService(session, config, progress=logs.append)._log_dns_coverage_summary(1, ["example.cn", "child.cn"])
 
-    assert "[dns] coverage: roots_with_dns=1/2, roots_with_subdomains=1/2, roots_with_public_ip=1/2, public_ips=1, manual_ips=1, failed_queries=1" in logs
+    assert "[dns] coverage: roots_with_dns=1/2, roots_with_subdomains=1/2, roots_with_public_ip=1/2, public_ips=1, manual_ips=1, no_record_queries=0, failed_queries=1" in logs
     assert any("roots without discovered subdomains: child.cn" in line for line in logs)
     assert any("roots without public A/AAAA: child.cn" in line for line in logs)
 

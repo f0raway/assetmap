@@ -2,7 +2,7 @@
 
 `assetmap` 是一个专用型 AI Agent：它只做一件事，就是围绕目标公司及其控股子公司，尽可能完整地测绘互联网数字资产暴露面，并生成可交付的 Word 报告和 Excel 附件。
 
-它不是通用爬虫，也不是单个扫描器。它把企业股权/备案资产采集、人工资产补充、子域名/DNS、主动/被动端口发现、服务识别、Web 页面截图识别、AI 分块分析、质量门禁和交付打包串成一条可断点续跑的流水线。
+它不是通用爬虫，也不是单个扫描器。它把企业股权/备案资产采集、人工资产补充、子域名/DNS、主动/被动端口发现、服务识别、Web 渲染 HTML 识别、AI 分块分析、质量门禁和交付打包串成一条可断点续跑的流水线。
 
 ## 一键运行
 
@@ -18,9 +18,9 @@ assetmap scan "苏州市能源发展集团有限公司"
 2. 对根域名做子域名枚举和 DNS 解析。
 3. 合并 DNS 推理 IP、手工 IP、FOFA 被动端口和 Nmap 主动扫描结果。
 4. 识别端口上运行的服务，生成 Web URL 入口。
-5. 打开 Web 页面截图，调用多模态 AI 识别系统名称、网站用途、页面类型和业务功能。
+5. 用浏览器加载 Web 页面，保存渲染后的 HTML 和 DOM 摘要，再调用文本 AI 识别系统名称、网站用途、页面类型和业务功能。
 6. 分块调用 AI 分析 DNS、端口、Web 和总体暴露面。
-7. 生成 Word 报告、两个 Excel 附件、质量门禁、复核工作单、补全计划和交付压缩包。
+7. 生成 Word 报告、两个 Excel 附件、质量门禁和客户交付压缩包。
 8. 校验交付包 manifest、文件大小、SHA256 和关键结构。
 
 默认情况下，`scan` 会复用同名目标最近一次任务并断点续跑。只有确认要完全重新采集时才使用：
@@ -42,7 +42,7 @@ assetmap scan "苏州市能源发展集团有限公司" --manual-file data/manua
 assetmap scan "苏州市能源发展集团有限公司" --strict
 ```
 
-`--strict` 会在质量门禁存在警告时停止打包。日常测绘建议不用 `--strict`，因为中低等级缺口会被写进报告、复核工作单和补全计划。
+`--strict` 会在质量门禁存在警告时停止打包。客户正式交付建议使用该参数；中低等级缺口会明确写入报告与质量摘要。
 
 ## 初始化
 
@@ -58,7 +58,7 @@ assetmap env-check
 assetmap ai-check
 ```
 
-如果需要 Web 页面截图和视觉识别，再安装浏览器自动化依赖：
+如果需要加载 JavaScript 页面并采集渲染后的 HTML，再安装浏览器自动化依赖：
 
 ```powershell
 pip install -e .[visual]
@@ -98,14 +98,25 @@ assetmap init --force
 
 ```powershell
 assetmap configure       # 交互式填写本地配置与 API 凭证
-assetmap install-tools   # 安装 subfinder、dnsx、nmap
+assetmap install-tools   # 安装 subfinder、dnsx、nmap、httpx
 assetmap env-check       # 检查密钥、字典、工具与浏览器
 assetmap ai-check        # 验证 AI 网关连通性
 ```
 
+不熟悉命令行时，可安装图形控制台并启动本机页面：
+
+```powershell
+pip install -e ".[web]"
+assetmap ui
+```
+
+浏览器会自动打开 `http://127.0.0.1:8765`。控制台只允许本机访问，提供环境引导、所有配置参数、任务启动/续跑、实时日志和交付包下载；关闭命令窗口即可停止。
+
+所有命令都会以仓库根目录的 `config.yaml` 为基准解析数据库、`data/`、字典和工具目录；即使误在 `assetmap/` 子目录中执行，也不会再创建第二套任务数据。
+
 ## 配置重点
 
-项目默认生成深度测绘配置：启用 Nmap 与 FOFA 双来源、全端口服务识别、完整子域名字典、AI 分析和全页高精度截图。请只对已获授权的目标执行；首次运行前必须在 `config.yaml` 填写天眼查、FOFA 和 AI 凭证。
+项目默认生成深度测绘配置：启用 Nmap 与 FOFA 双来源、全端口服务识别、完整子域名字典、AI 分析和浏览器渲染 HTML 取证。请只对已获授权的目标执行；首次运行前必须在 `config.yaml` 填写天眼查、FOFA 和 AI 凭证。
 
 `assetmap scan` 会在开始任何外部采集前执行环境预检查；缺少凭证、扫描工具、字典或浏览器时会直接列出缺项并停止，避免产生不完整任务或无效外部请求。
 
@@ -113,55 +124,72 @@ assetmap ai-check        # 验证 AI 网关连通性
 
 `subfinder` 是默认的被动子域名发现工具，但它的覆盖率依赖各数据源的个人 API Key。没有 Key 也能运行，只是结果会明显变少；Key 不应写入 `config.yaml`、报告、命令行历史或 Git 仓库。
 
-推荐使用 Subfinder 的独立 Provider 配置文件：
+Subfinder 的 Provider 密钥使用项目内独立文件，程序会通过 `-pc` 显式指定它：
 
 ```text
-macOS / Linux: ~/.config/subfinder/provider-config.yaml
+config/subfinder/provider-config.yaml
 ```
 
-也可通过 `-pc <文件路径>` 或环境变量 `SUBFINDER_PROVIDER_CONFIG` 指定该文件。建议优先按自身已开通的账号配置 Chaos、Censys、FOFA、GitHub、SecurityTrails、Shodan、ZoomEye、VirusTotal 等 Provider。运行子域名阶段时，程序也会给出这一提示；请只填入你自己拥有且有权使用的密钥。
+先复制 `config/subfinder/provider-config.example.yaml`，再填写你自己的 Provider Key。真实文件已被 Git 忽略。建议优先按自身已开通的账号配置 Chaos、Censys、FOFA、GitHub、SecurityTrails、Shodan、ZoomEye、VirusTotal 等 Provider；请只填入你自己拥有且有权使用的密钥。
 
-企业和备案资产采集使用项目内置脚本：
+企业发现使用项目内置采集器。用户只需配置天眼查凭证和股权穿透范围：
 
 ```yaml
-enscan:
-  script: assetmap/collectors/tyc_invest_crawler.py
+enterprise_discovery:
   tycid: YOUR_TYCID
   auth_token: YOUR_TYC_AUTH_TOKEN
-  request_delay_seconds: 1.0
-  request_timeout_seconds: 20
-  asset_workers: 5
+  control_threshold: 0.47  # 持股比例大于或等于 47% 时继续追踪。
+  max_depth: 10            # 目标企业为第 0 层。
 ```
 
-端口发现可以主动、被动或两者同时开启：
+为降低平台风控风险，采集器固定使用串行请求、每次请求前等待 0.2 秒、单次请求超时 6 秒、最多重试 3 次，并默认跳过注销、吊销和经营异常企业。任务没有总时限；中断后可利用检查点继续执行。
+
+如需单独调试企业发现阶段，可直接运行：
+
+```powershell
+python -m assetmap.stages.enterprise_discovery --target "公司名称"
+python -m assetmap.stages.enterprise_discovery --task-id 12
+```
+
+该入口与完整流水线复用同一套生产阶段逻辑；`--fresh` 仅可与 `--target` 一起使用。
+
+### 统一编排与独立调试
+
+每个环节都可以单独运行，统一流程也**只调用这些独立阶段的公开入口**，不会另有一套隐藏的服务调用路径。阶段之间通过同一个 SQLite 任务库衔接，因此可以先独立调试任一阶段，再从该阶段继续完整流程。
+
+```powershell
+# 从企业发现开始，顺序执行全部独立阶段。
+assetmap pipeline "公司名称"
+
+# 从已有任务的端口发现开始，继续到报告。
+assetmap pipeline --task-id <task_id> --from-stage port-discovery
+
+# 与旧命令兼容：assetmap run 现在也使用相同的独立阶段编排器。
+assetmap run <task_id>
+```
+
+统一编排阶段名称为：`enterprise-discovery`、`domain-mapping`、`port-discovery`、`service-identification`、`web-identification`、`report-generation`。旧名称 `subdomains`、`port-scan`、`classify`、`url-discover`、`report` 仍可用于 `assetmap run` 和 `--from-stage`，以保证已有操作习惯不受影响。
+
+普通续跑会跳过完成的阶段；域名/DNS 阶段存在可恢复缺口时会自动补跑。页面的 `http_probe_fallback` 属于已保存的降级结果，普通续跑不会重新打开浏览器；需要时请显式增加 `--retry-failed` 或 `--rerun-urls`。
+
+端口发现固定同时执行两种来源：Nmap 对已确认源站 IP 做全端口服务识别；FOFA 提供被动端口线索，程序只会对「FOFA 有、首次 Nmap 未证实」的端口逐个再次使用 `-sV` 主动复核。Python 侧串行执行，且不设置批量任务总时限。
 
 ```yaml
-port_scan:
-  target_sources_enabled:
-    - ai
-    - manual
-    - dns_public
-  sources_enabled:
-    - fofa
-    - nmap
+domain_mapping:
+  subfinder_provider_config: config/subfinder/provider-config.yaml
+  dnsx_wordlist: data/wordlists/Subdomain.txt
+tools:
+  nmap_command: '{binary} -Pn -p- --open -sV --version-intensity 5 -iL {targets_file} -oX {xml_output} -oN {normal_output}'
 fofa:
   email: YOUR_FOFA_EMAIL
   api_key: YOUR_FOFA_API_KEY
 ```
 
-Web 截图与视觉识别：
+端口发现也可独立调试；它读取同一任务中域名测绘已确认的源站 IP，并把结果写回同一个数据库：
 
-```yaml
-url_discovery:
-  timeout_seconds: 15
-  page_hard_timeout_seconds: 60
-  visual_max_pages: 200
-  browser_channel: ""
-  browser_headless: true
-  browser_wait_until: domcontentloaded
-  browser_wait_after_load_ms: 2500
-  screenshot_width: 1365
-  screenshot_height: 900
+```powershell
+python -m assetmap.stages.port_discovery --task-id 12
+python -m assetmap.stages.port_discovery --task-id 12 --rerun
 ```
 
 AI 配置：
@@ -187,7 +215,7 @@ flowchart TD
   B --> C["subdomains: 子域名枚举与 DNS 解析"]
   C --> D["port-scan: Nmap/FOFA 端口发现"]
   D --> E["classify: 服务识别与 Web 入口生成"]
-  E --> F["url-discover: 浏览器截图与视觉 AI 识别"]
+  E --> F["url-discover: 浏览器渲染 HTML 与文本 AI 识别"]
   F --> G["report: AI 分块分析与 Word/Excel 报告"]
   G --> H["quality-check: 质量门禁"]
   H --> I["package-report/deliver: 交付打包与校验"]
@@ -276,17 +304,20 @@ assetmap run <task_id> --from-stage subdomains
 系统会：
 
 - 用 `subfinder` 做被动子域名枚举。
-- 用 `dnsx` 和 `tools.wordlist` 做主动子域名发现与 DNS 解析。
+- 用 `dnsx` 和 `domain_mapping.dnsx_wordlist` 做主动子域名发现与 DNS 解析。
 - 解析 A/AAAA/CNAME/MX/TXT 等记录。
-- 让 AI 从 DNS 记录中判断更可能是真实业务服务器的公网 IP。
+- 串行执行工具和 DNS 查询；外部工具自身的并发参数不受影响。
+- 先硬性剔除 NS 基础设施、所有 CNAME 链相关地址、已知 CDN/WAF 代理网段等非源站候选。
+- 仅让 AI 审核剩余的直连 A/AAAA 候选；只有 `include + high` 才会进入主动扫描。
 - 生成 `data/subdomains/task_<task_id>/subdomain_audit.json`。
 
-默认深度配置使用约 73 万条字典，并为主动发现预留 90 分钟。工具任务、DNS 查询如果因网络或临时错误失败，会在下一次普通 `assetmap run <task_id>` 时自动补试；不需要先删除数据库记录。
+工具任务不设置总时限。解析失败会在下一次普通 `assetmap run <task_id>` 时自动补试；不需要先删除数据库记录。
 
-如果 DNS 污染或解析器异常，可配置 `dns.nameservers` 后重跑：
+也可以独立调试域名测绘阶段：
 
 ```powershell
-assetmap run <task_id> --from-stage subdomains --rerun-dns
+python -m assetmap.stages.domain_mapping --task-id 12
+python -m assetmap.stages.domain_mapping --task-id 12 --rerun-tools --rerun-dns
 ```
 
 ### 4. 端口发现
@@ -297,11 +328,7 @@ assetmap run <task_id> --from-stage subdomains --rerun-dns
 assetmap run <task_id> --from-stage port-scan
 ```
 
-目标 IP 来源：
-
-- AI 从 DNS 记录中判断的真实公网 IP。
-- 手工导入的 IP。
-- DNS 解析出的公网 A/AAAA。
+目标 IP 只来自域名测绘阶段中持久化的严格源站决策：AI 高置信放行的源站 IP，以及手工确认的 IP。普通 DNS 公网 A/AAAA 记录不会直接进入主动扫描。
 
 端口来源：
 
@@ -316,6 +343,9 @@ assetmap run <task_id> --from-stage port-scan
 
 - `data/nmap/task_<task_id>/target_sources.json`
 - `data/nmap/task_<task_id>/fofa_errors.json`
+- `data/nmap/task_<task_id>/port_anomaly_audit.json`（全端口 TCP 接收/`tcpwrapped` 等异常响应）
+
+端口发现会先用 8 个分散端口做轻量预检。若某个 IP 对所有预检端口都返回开放，系统会将其标记为“疑似 TCP 全端口接收器”，跳过该 IP 的全端口 `-sV` 扫描，不把数万个 `tcpwrapped` 结果当作真实服务；原始预检证据与判断规则会写入异常响应审计文件。
 
 ### 5. 服务识别与 URL 入口
 
@@ -323,6 +353,7 @@ assetmap run <task_id> --from-stage port-scan
 
 ```powershell
 assetmap run <task_id> --from-stage classify
+python -m assetmap.stages.service_identification --task-id <task_id>
 ```
 
 系统会根据端口、协议、HTTP 探测、标题、Server、FOFA 信息等判断：
@@ -334,12 +365,22 @@ assetmap run <task_id> --from-stage classify
 - VPN/网关。
 - 其他未知服务。
 
+服务识别由 ProjectDiscovery `httpx` 执行：它会输出状态码、标题、Web Server、技术指纹、页面哈希、favicon 哈希、CNAME、ASN 与 CDN/WAF 线索。程序会为每个已发现域名保留完整 URL，以保留虚拟主机和 TLS SNI；80 等端口先尝试 HTTP，443/8443/9443 先尝试 HTTPS，只有首次协议没有响应时才会回退另一种协议。Python 只顺序执行“首选协议”和“回退协议”两个批次；httpx 在单个批次内固定 30 并发、每秒最多 100 请求，终端会显示其统计进度。
+
+用户只需配置下列 Web 探测参数；httpx 的输出字段、重试、内部并发和限速策略由程序固定管理：
+
+```yaml
+web_probe:
+  timeout_seconds: 8.0
+  user_agent: Mozilla/5.0 (...) Chrome/... Safari/537.36
+```
+
 审计文件：
 
 - `data/classify/task_<task_id>/web_probe_audit.json`
 - `data/classify/task_<task_id>/service_classification_audit.json`
 
-### 6. Web 截图与视觉识别
+### 6. Web 渲染 HTML 与智能识别
 
 命令：
 
@@ -350,29 +391,30 @@ assetmap run <task_id> --from-stage url-discover
 系统会：
 
 - 从 Web 服务中生成 URL 入口。
-- 用本机 Chrome 打开页面。
-- 截图保存到 `data/screenshots/task_<task_id>/`。
-- 把截图交给多模态 AI，识别系统名称、网站用途、页面类型、登录特征、业务功能。
+- 用 Playwright Chromium 打开页面；整个阶段复用同一个浏览器会话，逐页处理。
+- 将 JavaScript 加载完成后的 HTML 保存到 `data/rendered_html/task_<task_id>/`，并提取标题、可见文本、表单和链接摘要。
+- 将这些文本证据交给 AI，识别系统名称、网站用途、页面类型、登录特征、业务功能；不要求模型支持图片输入。
 - 对重复页面复用已有识别结果。
-- 对截图失败但 HTTP 探测有证据的页面，降级为 HTTP 探测摘要。
+- 对页面渲染失败但 HTTP 探测有证据的页面，降级为 HTTP 探测摘要。
 
-为什么会出现白板截图或截图缺失：
+为什么会出现渲染 HTML 缺失：
 
 - 页面本身加载后是空白页、跳转页或单页应用未渲染完成。
 - 页面需要登录态、客户端证书、内网源地址或特定 Host Header。
 - TLS/协议不匹配，例如 HTTP 请求打到了 HTTPS 端口。
 - 页面阻断了自动化浏览器或返回了低价值错误页。
-- 截图超时、页面长期挂起、下载响应、空响应。
-- AI 图片分析失败时，系统可能保留截图但降级使用 HTTP 标题/服务信息。
-- 重复页面复用识别结果时，不一定为每个 URL 生成独立截图。
+- 页面加载超时、页面长期挂起、下载响应、空响应。
+- AI 文本分析失败时，系统会保留 HTML 证据并降级使用 HTTP 标题/服务信息。
+- 重复页面复用识别结果时，不一定为每个 URL 保存独立 HTML 文件。
 
 当前优化：
 
-- 页面 DOM 明显空白时，不再把白图当作成功截图。
+- 页面 DOM 明显空白时，不再把它当作成功页面。
 - 空白页会等待额外时间和网络空闲后重试。
+- 浏览器不会为每个 URL 重复启动；单页超时或浏览器异常时才关闭并重建会话。
 - 仍为空白则记录 `blank page after load`，并降级到 HTTP 探测摘要。
-- `Web资产详情.xlsx` 的 `截图证据` Sheet 会给出 `截图状态` 和 `截图缺失原因`。
-- `visual_analysis_audit.json` 会记录截图 AI、HTTP 降级、失败、低置信度样例。
+- `Web资产详情.xlsx` 会给出 HTML 证据路径、识别方式和复核原因。
+- `visual_analysis_audit.json` 会记录 HTML AI、HTTP 降级、失败、低置信度样例。
 
 重试失败或降级页面：
 
@@ -380,7 +422,7 @@ assetmap run <task_id> --from-stage url-discover
 assetmap run <task_id> --from-stage url-discover --retry-failed
 ```
 
-全量重跑 URL 视觉识别：
+全量重跑 URL 页面识别：
 
 ```powershell
 assetmap run <task_id> --from-stage url-discover --rerun-urls
@@ -394,12 +436,21 @@ assetmap run <task_id> --from-stage url-discover --rerun-urls
 assetmap report <task_id>
 ```
 
+也可单独执行这一阶段，便于调试报告而不触发交付打包：
+
+```powershell
+python -m assetmap.stages.report_generation --task-id <task_id>
+python -m assetmap.stages.report_generation --task-id <task_id> --rerun-ai
+```
+
 报告会按四个分块调用 AI：
 
 - DNS 与域名解析分析。
 - 端口与服务暴露分析。
-- Web 资产视觉识别分析。
+- Web 资产页面识别分析。
 - 总体暴露面结论与处置建议。
+
+端口和 Web 数据量较大时，AI 会优先分析本地风险分值更高、敏感服务、远程接入及登录/管理入口；完整明细仍全部保留在 Excel 附件中。
 
 输出：
 
@@ -447,19 +498,24 @@ assetmap improve <task_id> --execute
 assetmap deliver <task_id>
 ```
 
-交付包包含：
+默认的客户交付包包含：
 
 - Word 报告。
 - `资产汇总.xlsx`。
 - `Web资产详情.xlsx`。
 - 质量门禁摘要。
-- 待补充资产模板。
-- 复核工作单。
-- 补全计划 JSON/TXT。
-- 子域名、DNS、端口、FOFA、服务识别、URL 视觉识别、报告 AI 审计文件。
-- 截图证据清单。
 - `manifest.json`。
 - `交付说明.txt`。
+
+默认包不包含原始渲染 HTML、运行日志、审计 JSON、复核工作单和补全计划，避免将页面内容、本机路径或内部诊断信息交给客户。
+
+如需给项目组留存完整审计材料，明确使用内部审计包选项：
+
+```powershell
+assetmap deliver <task_id> --include-internal-evidence
+```
+
+该包可能含原始网页 HTML 和运行审计，只能在授权范围内由项目组保管，不能作为客户常规分发材料。
 
 打包会先在临时目录完整构建并生成 ZIP，全部成功后才替换正式交付包；中途失败时，已有的交付目录和 ZIP 会被保留。
 
@@ -475,6 +531,7 @@ assetmap verify-package deliveries\task_<task_id>_<target>.zip
 
 ```powershell
 assetmap scan "公司名称"
+assetmap pipeline "公司名称"
 assetmap status <task_id>
 assetmap quality-check <task_id>
 assetmap deliver <task_id>
@@ -505,6 +562,9 @@ assetmap run <task_id> --from-stage port-scan --rerun-ports
 assetmap run <task_id> --from-stage classify --rerun-classify
 assetmap run <task_id> --from-stage url-discover --retry-failed
 assetmap run <task_id> --from-stage report --rerun-ai
+
+# 使用独立阶段名称也可以
+assetmap pipeline --task-id <task_id> --from-stage service-identification
 ```
 
 查看结果：
@@ -518,7 +578,7 @@ assetmap export <task_id> --format json
 ## 断点续跑原则
 
 - `discover "公司名称"` 和 `scan "公司名称"` 默认复用同名目标最近一次任务。
-- `run <task_id>` 默认只跑未完成或受新增数据影响的后续环节。
+- `run <task_id>` 与 `pipeline --task-id <task_id>` 默认只跑未完成或受新增数据影响的后续环节；二者均通过同一套独立阶段编排器执行。
 - 已完成但仍存在子域名/DNS、Nmap 或 FOFA 子任务失败时，状态会显示为 `completed_with_errors`；普通 `run` 会自动重试这些项。
 - `url-discover` 默认不会反复重跑已成功识别的页面。
 - `--retry-failed` 只补跑失败或 HTTP 降级页面。
@@ -530,7 +590,7 @@ assetmap export <task_id> --format json
 `quality-check` 的 `PASS/WARN/FAIL` 含义：
 
 - `PASS`：结构和覆盖门禁都通过。
-- `WARN`：可以交付，但存在中低等级缺口，交付包会附带补全计划和复核工作单。
+- `WARN`：存在中低等级缺口；是否交付由项目负责人确认，使用 `--strict` 可阻止打包。
 - `FAIL`：关键交付物缺失、结构损坏或质量门禁失败，需要修复后再交付。
 
 常见 WARN 不一定代表程序错误。例如：

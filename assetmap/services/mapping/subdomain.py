@@ -6,7 +6,6 @@ import os
 import re
 import shlex
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -25,6 +24,8 @@ from assetmap.models import (
     DnsQueryStatus,
     DnsRecord,
     InternetAsset,
+    OriginIpCandidate,
+    ScanTask,
     SubdomainEnumerationTask,
     SubdomainRecord,
     SubdomainToolRun,
@@ -39,6 +40,8 @@ SUBDOMAIN_RECORD_TYPES = ("A", "AAAA", "CNAME")
 SUPPORTED_SUBDOMAIN_TOOLS = {"subfinder", "dnsx"}
 INTERRUPTED_EXIT_CODES = {3221225786, -1073741510}
 INTERRUPTED_ERROR_MARKERS = ("^c", "keyboardinterrupt", "interrupted", "ctrl+c", "control-c")
+SUBDOMAIN_OUTPUT_MAX_LINES = 1000
+DNS_TIMEOUT_SECONDS = 6
 DNS_AI_BATCH_MAX_RECORDS = 1000
 DNS_AI_BATCH_MAX_CHARS = 45000
 DOH_ENDPOINTS = (
@@ -46,6 +49,22 @@ DOH_ENDPOINTS = (
     "https://cloudflare-dns.com/dns-query",
 )
 DOH_RECORD_TYPES = {"A": 1, "AAAA": 28, "CNAME": 5}
+PROXY_CNAME_SUFFIXES = (
+    "cdn.cloudflare.net", "cloudfront.net", "akamaized.net", "edgesuite.net", "fastly.net",
+    "cloudflare.net", "qcloudcdn.com", "myqcloud.com", "kunlunca.com", "alikunlun.com",
+    "waf", "incapdns.net", "cdn77.org", "hwcdn.net",
+)
+CLOUDFLARE_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
+        "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
+        "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+        "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+        "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+    )
+)
 
 
 def _utcnow() -> datetime:
@@ -128,6 +147,7 @@ class SubdomainService:
         self.session = session
         self.config = config
         self.progress = progress
+        self._last_ai_error: str | None = None
 
     def _log(self, message: str) -> None:
         if self.progress:
@@ -143,6 +163,8 @@ class SubdomainService:
         rerun_tools: bool = False,
         rerun_dns: bool = False,
     ) -> int:
+        if not self.session.get(ScanTask, scan_task_id):
+            raise ValueError(f"Scan task {scan_task_id} not found in the configured database.")
         task = self._get_or_create_task(scan_task_id)
         task.status = "running"
         task.stage = "enumerating"
@@ -153,6 +175,10 @@ class SubdomainService:
         try:
             self._reset_stale_running_tool_runs(scan_task_id)
             root_domains = self._root_domains(scan_task_id)
+            if not root_domains:
+                raise ValueError(
+                    "No ICP domains found for this task. Run enterprise discovery or import domain assets first."
+                )
             self._log(f"[subdomain] root domains: {len(root_domains)}")
             self._run_enumerators(scan_task_id, root_domains, rerun_tools=rerun_tools)
             self._log_tool_summary(scan_task_id)
@@ -165,6 +191,7 @@ class SubdomainService:
             self.session.add(task)
             self.session.commit()
             self._resolve_domains(scan_task_id, root_domains, MAIN_RECORD_TYPES)
+            self._resolve_nameserver_ips(scan_task_id)
 
             task.stage = "dns_subdomains"
             self.session.add(task)
@@ -173,20 +200,33 @@ class SubdomainService:
             self._log(f"[dns] subdomains: {len(subdomains)}")
             self._resolve_domains(scan_task_id, subdomains, SUBDOMAIN_RECORD_TYPES)
             self._log_dns_coverage_summary(scan_task_id, root_domains)
-            audit = self._write_subdomain_audit(scan_task_id, root_domains)
-            self._log(f"[subdomain] audit: {audit}")
-
-            if run_ai and self.config.ai.enabled:
+            task.stage = "origin_filter"
+            self.session.add(task)
+            self.session.commit()
+            self._build_origin_candidates(scan_task_id)
+            ai_ok = True
+            if run_ai:
                 task.stage = "ai"
                 self.session.add(task)
                 self.session.commit()
-                self._run_ai_analysis(scan_task_id)
+                ai_ok = self._run_ai_analysis(scan_task_id)
+            else:
+                self._exclude_unreviewed_candidates(scan_task_id, "ai_skipped")
 
-            task.status = "completed"
-            task.stage = "completed"
+            audit = self._write_subdomain_audit(scan_task_id, root_domains)
+            self._log(f"[subdomain] audit: {audit}")
+
+            task.status = "completed" if ai_ok else "completed_with_gaps"
+            task.stage = "completed" if ai_ok else "ai_unavailable"
+            task.error_message = None if ai_ok else self._last_ai_error
             task.finished_at = _utcnow()
             self.session.add(task)
             self.session.commit()
+            if not ai_ok:
+                self._log(
+                    "[origin] completed with gaps: AI review failed; no automatic origin IP was confirmed. "
+                    "Fix the AI gateway and rerun this stage to retry the pending candidates."
+                )
             return task.id
         except KeyboardInterrupt:
             task.status = "interrupted"
@@ -275,7 +315,7 @@ class SubdomainService:
 
     def _log_discovered_subdomains(self, scan_task_id: int) -> None:
         subdomains = self._subdomains(scan_task_id)
-        output_dir = Path("data") / "subdomains" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("subdomains", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "discovered_subdomains.txt"
         path.write_text("\n".join(subdomains) + ("\n" if subdomains else ""), encoding="utf-8")
@@ -286,23 +326,28 @@ class SubdomainService:
 
     def _binary_path(self, tool_name: str) -> str:
         suffix = ".exe" if __import__("platform").system().lower().startswith("windows") else ""
-        path = Path(self.config.tools.tools_dir) / tool_name / f"{tool_name}{suffix}"
-        resolved = ToolResolver(self.config.tools).executable(tool_name)
+        path = self.config.resolve_path(self.config.tools.tools_dir) / tool_name / f"{tool_name}{suffix}"
+        resolved = ToolResolver(self.config.tools, self.config.config_dir).executable(tool_name)
         if resolved:
             return str(resolved)
         return str(path) if path.exists() else tool_name
 
     def _format_command(self, template: str, tool_name: str, domain: str, output: Path) -> str:
-        return template.format(
+        templates = {
+            "subfinder": "{binary} -d {domain} -silent -all -pc {provider_config} -o {output}",
+            "dnsx": "{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc",
+        }
+        return templates[tool_name].format(
             binary=_quote(self._binary_path(tool_name)),
             domain=_quote(domain),
             output=_quote(str(output)),
-            wordlist=_quote(self.config.tools.wordlist),
+            provider_config=_quote(str(self.config.resolve_path(self.config.domain_mapping.subfinder_provider_config))),
+            wordlist=_quote(str(self.config.resolve_path(self.config.domain_mapping.dnsx_wordlist))),
         )
 
     def _run_enumerators(self, scan_task_id: int, root_domains: list[str], rerun_tools: bool = False) -> None:
         jobs: list[SubdomainToolRun] = []
-        output_root = Path("data") / "subdomains" / f"task_{scan_task_id}"
+        output_root = self.config.data_path("subdomains", f"task_{scan_task_id}")
         enabled_tools = self._enabled_subdomain_tools()
         self._log_subfinder_provider_hint(enabled_tools)
         for domain in root_domains:
@@ -343,12 +388,10 @@ class SubdomainService:
 
         if not jobs:
             return
-        self._log(f"[subdomain] running {len(jobs)} tool jobs in parallel")
-        workers = min(max(1, self.config.dns.max_workers), len(jobs), 8)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(self._run_tool_job, run.id) for run in jobs if run.id]
-            for future in as_completed(futures):
-                future.result()
+        self._log(f"[subdomain] running {len(jobs)} tool jobs serially")
+        for run in jobs:
+            if run.id:
+                self._run_tool_job(run.id)
 
     def _log_subfinder_provider_hint(self, enabled_tools: list[tuple[str, str]]) -> None:
         if not any(tool_name == "subfinder" for tool_name, _ in enabled_tools):
@@ -357,8 +400,8 @@ class SubdomainService:
             "[subfinder] 提示：未配置 provider API Key 仍可运行，但被动子域名覆盖率会明显下降。"
         )
         self._log(
-            "[subfinder] 建议：在 macOS/Linux 的 ~/.config/subfinder/provider-config.yaml 配置自己的 provider Key，"
-            "或通过 -pc / SUBFINDER_PROVIDER_CONFIG 指定文件；可优先配置 Chaos、Censys、FOFA、GitHub、"
+            f"[subfinder] 请在 {self.config.domain_mapping.subfinder_provider_config} 配置自己的 provider Key；"
+            "该文件已通过 -pc 显式传给 subfinder。可优先配置 Chaos、Censys、FOFA、GitHub、"
             "SecurityTrails、Shodan、ZoomEye、VirusTotal。请勿在终端、报告或仓库中粘贴 Key。"
         )
 
@@ -372,26 +415,10 @@ class SubdomainService:
         return any(marker in text for marker in INTERRUPTED_ERROR_MARKERS)
 
     def _enabled_subdomain_tools(self) -> list[tuple[str, str]]:
-        templates = {
-            "subfinder": self.config.tools.subfinder_command,
-            "dnsx": self.config.tools.dnsx_command,
-        }
-        enabled: list[tuple[str, str]] = []
-        for tool_name in self.config.tools.subdomain_tools_enabled:
-            normalized = tool_name.lower().strip()
-            if normalized not in SUPPORTED_SUBDOMAIN_TOOLS:
-                self._log(f"[subdomain] skip unsupported tool in config: {tool_name}")
-                continue
-            enabled.append((normalized, templates[normalized]))
-        return enabled
+        return [("subfinder", "builtin"), ("dnsx", "builtin")]
 
     def _enabled_subdomain_tool_names(self) -> list[str]:
-        names = []
-        for tool_name in self.config.tools.subdomain_tools_enabled:
-            normalized = tool_name.lower().strip()
-            if normalized in SUPPORTED_SUBDOMAIN_TOOLS and normalized not in names:
-                names.append(normalized)
-        return names or ["__none__"]
+        return ["subfinder", "dnsx"]
 
     def _get_or_create_tool_run(
         self,
@@ -448,7 +475,6 @@ class SubdomainService:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=self.config.tools.subdomain_tool_timeout_seconds,
                 )
                 run.exit_code = proc.returncode
                 run.stdout = proc.stdout[-20000:]
@@ -485,6 +511,40 @@ class SubdomainService:
                 for run in failed[:5]
             )
             self._log(f"[subdomain] failed tool sample: {sample}")
+
+    def _tool_discovery_stats(self, scan_task_id: int) -> dict[str, dict[str, int]]:
+        runs = self.session.exec(
+            select(SubdomainToolRun).where(
+                SubdomainToolRun.scan_task_id == scan_task_id,
+                SubdomainToolRun.tool_name.in_(SUPPORTED_SUBDOMAIN_TOOLS),
+            )
+        ).all()
+        subdomains = self.session.exec(
+            select(SubdomainRecord).where(SubdomainRecord.scan_task_id == scan_task_id)
+        ).all()
+        stats: dict[str, dict[str, int]] = {}
+        for tool_name in sorted(SUPPORTED_SUBDOMAIN_TOOLS):
+            tool_runs = [row for row in runs if row.tool_name == tool_name]
+            lines = 0
+            for run in tool_runs:
+                lines += sum(1 for _ in self._iter_tool_output_lines(run))
+            stats[tool_name] = {
+                "runs_completed": sum(1 for row in tool_runs if row.status == "completed"),
+                "runs_failed": sum(1 for row in tool_runs if row.status == "failed"),
+                "output_lines": lines,
+                "discovered_subdomains": sum(1 for row in subdomains if tool_name in (row.sources or [])),
+            }
+        return stats
+
+    def _log_tool_discovery_stats(self, scan_task_id: int) -> None:
+        for tool_name, stats in self._tool_discovery_stats(scan_task_id).items():
+            self._log(
+                f"[subdomain] {tool_name} results: completed={stats['runs_completed']}, "
+                f"failed={stats['runs_failed']}, output_lines={stats['output_lines']}, "
+                f"discovered={stats['discovered_subdomains']}"
+            )
+            if stats["runs_completed"] and not stats["output_lines"]:
+                self._log(f"[subdomain] warning: {tool_name} completed but returned no usable subdomain output")
 
     def _log_dns_coverage_summary(self, scan_task_id: int, root_domains: list[str]) -> None:
         if not root_domains:
@@ -524,13 +584,17 @@ class SubdomainService:
             and (row.raw_payload or {}).get("kind") == "manual_ip"
         }
         failed_queries = [row for row in status_rows if row.status == "failed"]
+        no_record_queries = [
+            row for row in status_rows
+            if row.status == "completed" and self._is_no_record_message(row.error_message)
+        ]
         self._log(
             "[dns] coverage: "
             f"roots_with_dns={len(roots_with_dns)}/{len(root_domains)}, "
             f"roots_with_subdomains={len(roots_with_subdomains)}/{len(root_domains)}, "
             f"roots_with_public_ip={len(public_ip_roots)}/{len(root_domains)}, "
             f"public_ips={len(public_ips)}, manual_ips={len(manual_ips)}, "
-            f"failed_queries={len(failed_queries)}"
+            f"no_record_queries={len(no_record_queries)}, failed_queries={len(failed_queries)}"
         )
         no_subdomains = sorted(root_set - roots_with_subdomains)
         if no_subdomains:
@@ -543,7 +607,7 @@ class SubdomainService:
         root_domains = root_domains or self._root_domains(scan_task_id)
         root_set = set(root_domains)
         enabled_names = self._enabled_subdomain_tool_names()
-        output_dir = Path("data") / "subdomains" / f"task_{scan_task_id}"
+        output_dir = self.config.data_path("subdomains", f"task_{scan_task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         runs = self.session.exec(
             select(SubdomainToolRun).where(
@@ -597,12 +661,23 @@ class SubdomainService:
             for row in status_rows
             if row.status == "failed"
         ]
+        no_record_queries = [
+            {
+                "fqdn": row.fqdn,
+                "root_domain": row.root_domain,
+                "record_type": row.record_type,
+                "message": row.error_message,
+            }
+            for row in status_rows
+            if row.status == "completed" and self._is_no_record_message(row.error_message)
+        ]
         payload = {
             "scan_task_id": scan_task_id,
             "generated_at": _utcnow().isoformat(),
             "root_domain_count": len(root_domains),
             "root_domains": root_domains,
             "tool_run_counts": dict(sorted(method_counts.items())),
+            "tool_discovery_stats": self._tool_discovery_stats(scan_task_id),
             "failed_tool_runs": failed_runs[:100],
             "interrupted_tool_run_count": sum(1 for item in failed_runs if item["interrupted"]),
             "subdomain_count": len(subdomain_rows),
@@ -613,10 +688,23 @@ class SubdomainService:
             "roots_with_public_ip_count": len(roots_with_public_ip),
             "failed_dns_query_count": len(failed_queries),
             "failed_dns_query_samples": failed_queries[:100],
+            "no_record_dns_query_count": len(no_record_queries),
+            "no_record_dns_query_samples": no_record_queries[:100],
         }
         path = output_dir / "subdomain_audit.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
+
+    def _is_no_record_message(self, message: str | None) -> bool:
+        text = str(message or "").lower()
+        return bool(text) and (
+            text.startswith("doh no ")
+            or text == "doh nxdomain"
+            or "does not contain an answer" in text
+            or "the dns response does not contain an answer" in text
+            or "no answer" in text
+            or "nxdomain" in text
+        )
 
     def _parse_tool_outputs(self, scan_task_id: int, root_domains: list[str]) -> None:
         runs = self.session.exec(
@@ -629,7 +717,7 @@ class SubdomainService:
         before = len(self._subdomains(scan_task_id))
         dns_from_tools = 0
         skipped_large_outputs = 0
-        max_output_lines = max(1, self.config.tools.subdomain_tool_max_output_lines)
+        max_output_lines = SUBDOMAIN_OUTPUT_MAX_LINES
         for run in runs:
             if self._tool_output_exceeds_limit(run, max_output_lines):
                 removed = self._delete_tool_only_subdomains(scan_task_id, run.root_domain, run.tool_name)
@@ -655,6 +743,7 @@ class SubdomainService:
             self._log(f"[dns] merged tool DNS records: {dns_from_tools}")
         if skipped_large_outputs:
             self._log(f"[subdomain] skipped large tool outputs: {skipped_large_outputs}")
+        self._log_tool_discovery_stats(scan_task_id)
 
     def _tool_output_exceeds_limit(self, run: SubdomainToolRun, max_lines: int) -> bool:
         count = 0
@@ -666,9 +755,10 @@ class SubdomainService:
 
     def _iter_tool_output_lines(self, run: SubdomainToolRun) -> Iterable[str]:
         output = Path(run.output_path)
-        if output.exists():
+        if output.is_file():
             with output.open("r", encoding="utf-8", errors="ignore") as handle:
                 yield from handle
+            return
         if run.stdout:
             yield from run.stdout.splitlines()
 
@@ -730,10 +820,8 @@ class SubdomainService:
 
     def _resolver(self) -> dns.resolver.Resolver:
         resolver = dns.resolver.Resolver()
-        resolver.timeout = max(1.0, self.config.dns.timeout_seconds)
-        resolver.lifetime = min(max(1.0, self.config.dns.lifetime_seconds), 60.0)
-        if self.config.dns.nameservers:
-            resolver.nameservers = self.config.dns.nameservers
+        resolver.timeout = DNS_TIMEOUT_SECONDS
+        resolver.lifetime = DNS_TIMEOUT_SECONDS
         return resolver
 
     def _resolve_domains(self, scan_task_id: int, domains: Iterable[str], record_types: Iterable[str]) -> None:
@@ -747,30 +835,54 @@ class SubdomainService:
                 jobs.append((domain, root, record_type))
         if not jobs:
             return
-        workers = min(max(1, self.config.dns.max_workers), len(jobs), 10)
-        self._log(f"[dns] resolving {len(jobs)} queries with workers={workers}")
+        self._log(f"[dns] resolving {len(jobs)} queries serially")
         saved = 0
         skipped = 0
         completed = 0
         total = len(jobs)
         progress_interval = max(1, total // 10)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(self._resolve_one, scan_task_id, domain, root, record_type)
-                for domain, root, record_type in jobs
-            ]
-            for future in as_completed(futures):
-                result = future.result()
-                saved += result.get("saved", 0)
-                skipped += result.get("skipped", 0)
-                completed += 1
-                if completed % progress_interval == 0 or completed == total:
-                    self._log(f"[dns] progress: {completed}/{total} queries completed")
+        for domain, root, record_type in jobs:
+            result = self._resolve_one(scan_task_id, domain, root, record_type)
+            saved += result.get("saved", 0)
+            skipped += result.get("skipped", 0)
+            completed += 1
+            if completed % progress_interval == 0 or completed == total:
+                self._log(f"[dns] progress: {completed}/{total} queries completed")
         self._log(f"[dns] resolved records saved={saved}, skipped_non_public={skipped}")
 
     def _root_for_domain(self, scan_task_id: int, fqdn: str) -> str:
         roots = self._root_domains(scan_task_id)
         return next((root for root in roots if fqdn == root or fqdn.endswith(f".{root}")), fqdn)
+
+    def _resolve_nameserver_ips(self, scan_task_id: int) -> None:
+        """Resolve NS hostnames so their addresses are explicitly excluded later."""
+        ns_records = self.session.exec(
+            select(DnsRecord).where(
+                DnsRecord.scan_task_id == scan_task_id,
+                DnsRecord.record_type == "NS",
+            )
+        ).all()
+        jobs = [(record.value, record.root_domain, family) for record in ns_records for family in ("A", "AAAA")]
+        if not jobs:
+            return
+        self._log(f"[dns] resolving {len(jobs)} NS infrastructure queries serially")
+        for hostname, root_domain, record_type in jobs:
+            self._resolve_one(scan_task_id, hostname, root_domain, record_type)
+        ns_hosts = {record.value for record in ns_records}
+        rows = self.session.exec(
+            select(DnsRecord).where(
+                DnsRecord.scan_task_id == scan_task_id,
+                DnsRecord.fqdn.in_(ns_hosts),
+                DnsRecord.record_type.in_(["A", "AAAA"]),
+            )
+        ).all()
+        for row in rows:
+            payload = dict(row.raw_payload or {})
+            payload["kind"] = "nameserver_ip"
+            row.raw_payload = payload
+            self.session.add(row)
+        if rows:
+            self.session.commit()
 
     def _dns_status(self, scan_task_id: int, fqdn: str, record_type: str) -> DnsQueryStatus | None:
         return self.session.exec(
@@ -864,7 +976,7 @@ class SubdomainService:
         if record_type not in DOH_RECORD_TYPES:
             return {"completed": False, "records": [], "error": None}
         errors = []
-        doh_timeout = min(self.config.dns.lifetime_seconds, 10.0)
+        doh_timeout = DNS_TIMEOUT_SECONDS
         for endpoint in DOH_ENDPOINTS:
             try:
                 with httpx.Client(timeout=doh_timeout, trust_env=False) as client:
@@ -945,12 +1057,127 @@ class SubdomainService:
             session.rollback()
             return False
 
-    def _run_ai_analysis(self, scan_task_id: int) -> None:
-        payloads = self._ai_payloads(scan_task_id)
-        if not payloads:
-            self._log("[ai] skip: no DNS records")
-            return
-        fingerprint = stable_hash({"schema_version": 3, "batches": payloads})
+    def _build_origin_candidates(self, scan_task_id: int) -> None:
+        """Build a strict, persisted allow-list. DNS answers never go straight to nmap."""
+        self.session.exec(delete(OriginIpCandidate).where(OriginIpCandidate.scan_task_id == scan_task_id))
+        self.session.commit()
+        records = self.session.exec(
+            select(DnsRecord).where(DnsRecord.scan_task_id == scan_task_id)
+        ).all()
+        cname_by_fqdn: dict[str, list[str]] = {}
+        for row in records:
+            if row.record_type == "CNAME":
+                cname_by_fqdn.setdefault(row.fqdn, []).append(row.value.lower())
+        ips: dict[str, list[DnsRecord]] = {}
+        for row in records:
+            if row.record_type in {"A", "AAAA"} and _is_public_ip(row.value):
+                ips.setdefault(row.value, []).append(row)
+        candidates: list[OriginIpCandidate] = []
+        for ip, ip_rows in sorted(ips.items()):
+            fqdns = sorted({row.fqdn for row in ip_rows})
+            reasons: set[str] = set()
+            manual = any((row.raw_payload or {}).get("kind") == "manual_ip" for row in ip_rows)
+            if manual:
+                decision, confidence, source = "manual_confirmed", "manual", "manual"
+                reasons.add("manual_ip")
+            else:
+                source = "dns"
+                if any((row.raw_payload or {}).get("kind") == "nameserver_ip" for row in ip_rows):
+                    reasons.add("nameserver_infrastructure")
+                cname_targets = sorted({target for fqdn in fqdns for target in cname_by_fqdn.get(fqdn, [])})
+                if cname_targets:
+                    reasons.add("cname_chain")
+                    if any(self._is_proxy_cname(target) for target in cname_targets):
+                        reasons.add("known_cdn_waf_cname")
+                if self._is_cloudflare_ip(ip):
+                    reasons.add("known_cloudflare_proxy_range")
+                if reasons:
+                    decision, confidence = "exclude", "high"
+                else:
+                    decision, confidence = "pending_ai", "low"
+            evidence = {
+                "record_types": sorted({row.record_type for row in ip_rows}),
+                "root_domains": sorted({row.root_domain for row in ip_rows}),
+                "cname_targets": sorted({target for fqdn in fqdns for target in cname_by_fqdn.get(fqdn, [])}),
+                "records": [self._dns_record_line(row) for row in ip_rows],
+            }
+            candidates.append(
+                OriginIpCandidate(
+                    scan_task_id=scan_task_id,
+                    ip=ip,
+                    decision=decision,
+                    confidence=confidence,
+                    reason_codes=sorted(reasons),
+                    associated_fqdns=fqdns,
+                    evidence=evidence,
+                    source=source,
+                )
+            )
+        self.session.add_all(candidates)
+        self.session.commit()
+        by_decision: dict[str, int] = {}
+        for candidate in candidates:
+            by_decision[candidate.decision] = by_decision.get(candidate.decision, 0) + 1
+        summary = ", ".join(f"{name}={count}" for name, count in sorted(by_decision.items())) or "none=0"
+        self._log(f"[origin] strict candidate filter: {summary}")
+
+    def _is_proxy_cname(self, hostname: str) -> bool:
+        value = hostname.lower().rstrip(".")
+        return any(value == suffix or value.endswith(f".{suffix}") for suffix in PROXY_CNAME_SUFFIXES)
+
+    def _is_cloudflare_ip(self, value: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return any(ip in network for network in CLOUDFLARE_NETWORKS)
+
+    def _exclude_unreviewed_candidates(self, scan_task_id: int, reason: str) -> None:
+        rows = self.session.exec(
+            select(OriginIpCandidate).where(
+                OriginIpCandidate.scan_task_id == scan_task_id,
+                OriginIpCandidate.decision == "pending_ai",
+            )
+        ).all()
+        for row in rows:
+            row.decision = "exclude"
+            row.confidence = "low"
+            row.reason_codes = sorted(set(row.reason_codes or []) | {reason})
+            row.updated_at = _utcnow()
+            self.session.add(row)
+        if rows:
+            self.session.commit()
+        self._log(f"[origin] excluded {len(rows)} unreviewed candidates: {reason}")
+
+    def _run_ai_analysis(self, scan_task_id: int) -> bool:
+        self._last_ai_error = None
+        candidates = self.session.exec(
+            select(OriginIpCandidate).where(
+                OriginIpCandidate.scan_task_id == scan_task_id,
+                OriginIpCandidate.decision == "pending_ai",
+            )
+        ).all()
+        if not candidates:
+            self._log("[ai] skip: strict filter left no automatic origin candidates")
+            return True
+        payload = {
+            "schema_version": 4,
+            "scan_task_id": scan_task_id,
+            "candidates": [
+                {
+                    "ip": row.ip,
+                    "fqdns": row.associated_fqdns,
+                    "evidence": row.evidence,
+                }
+                for row in candidates
+            ],
+            "instructions": (
+                "These are only direct public A/AAAA candidates after hard exclusion of NS, CNAME, and known CDN/WAF. "
+                "Approve an IP only when the supplied evidence supports a direct origin server with HIGH confidence. "
+                "Unknown or insufficient evidence must be excluded."
+            ),
+        }
+        fingerprint = stable_hash({"schema_version": 4, "payload": payload})
         row = self.session.exec(
             select(AiAnalysis).where(
                 AiAnalysis.scan_task_id == scan_task_id,
@@ -964,31 +1191,77 @@ class SubdomainService:
             and row.prompt_json.get("fingerprint") == fingerprint
         ):
             self._log("[ai] skip cached DNS inference")
-            return
-        responses = []
-        summaries = []
-        for index, payload in enumerate(payloads, start=1):
-            if len(payloads) > 1:
-                self._log(f"[ai] DNS inference batch {index}/{len(payloads)} records={len(payload['dns_records'])}")
+            return True
+        try:
             response = self._call_ai(self.config.ai, payload)
-            responses.append(response)
-            summaries.append(response.get("choices", [{}])[0].get("message", {}).get("content") or "")
-        summary = summaries[0] if len(summaries) == 1 else self._merge_dns_ai_summaries(summaries)
+            summary = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        except Exception as exc:
+            self._last_ai_error = str(exc)[:1000]
+            self._exclude_unreviewed_candidates(scan_task_id, "ai_unavailable")
+            if not row:
+                row = AiAnalysis(scan_task_id=scan_task_id, analysis_type="dns_inference")
+            row.status = "failed"
+            row.model = self.config.ai.model
+            row.prompt_json = {"fingerprint": fingerprint, **payload}
+            row.response_json = {"error": str(exc)[:1000]}
+            row.summary = None
+            row.updated_at = _utcnow()
+            self.session.add(row)
+            self.session.commit()
+            self._log(f"[ai] unavailable: automatic candidates were excluded ({self._last_ai_error})")
+            return False
+        self._apply_ai_origin_decisions(scan_task_id, summary)
         if not row:
             row = AiAnalysis(scan_task_id=scan_task_id, analysis_type="dns_inference")
         row.status = "completed"
         row.model = self.config.ai.model
-        if len(payloads) == 1:
-            row.prompt_json = {"fingerprint": fingerprint, **payloads[0]}
-            row.response_json = responses[0]
-        else:
-            row.prompt_json = {"fingerprint": fingerprint, "schema_version": 3, "batch_count": len(payloads), "batches": payloads}
-            row.response_json = {"batches": responses}
+        row.prompt_json = {"fingerprint": fingerprint, **payload}
+        row.response_json = response
         row.summary = summary
         row.updated_at = _utcnow()
         self.session.add(row)
         self.session.commit()
         self._log("[ai] analysis completed")
+        return True
+
+    def _apply_ai_origin_decisions(self, scan_task_id: int, summary: str) -> None:
+        approved = self._parse_ai_approved_ips(summary)
+        rows = self.session.exec(
+            select(OriginIpCandidate).where(
+                OriginIpCandidate.scan_task_id == scan_task_id,
+                OriginIpCandidate.decision == "pending_ai",
+            )
+        ).all()
+        for row in rows:
+            row.updated_at = _utcnow()
+            if row.ip in approved:
+                row.decision = "include"
+                row.confidence = "high"
+                row.reason_codes = sorted(set(row.reason_codes or []) | {"ai_high_confidence"})
+            else:
+                row.decision = "exclude"
+                row.confidence = "low"
+                row.reason_codes = sorted(set(row.reason_codes or []) | {"ai_not_high_confidence"})
+            self.session.add(row)
+        self.session.commit()
+        self._log(f"[origin] AI approved high-confidence candidates: {len(approved)}")
+
+    def _parse_ai_approved_ips(self, summary: str) -> set[str]:
+        match = re.search(
+            r"ORIGIN_IP_DECISIONS\s*(.*?)\s*END_ORIGIN_IP_DECISIONS",
+            summary or "",
+            flags=re.I | re.S,
+        )
+        if not match:
+            return set()
+        approved: set[str] = set()
+        for line in match.group(1).splitlines():
+            parts = [part.strip().lower() for part in line.lstrip("- ").split("|")]
+            if len(parts) < 3 or parts[1] != "include" or parts[2] != "high":
+                continue
+            if _is_public_ip(parts[0]):
+                approved.add(parts[0])
+        return approved
 
     def _ai_payload(self, scan_task_id: int) -> dict:
         payloads = self._ai_payloads(scan_task_id)
@@ -1143,13 +1416,12 @@ class SubdomainService:
             {
                 "role": "system",
                 "content": (
-                    "你是互联网资产测绘分析助手。你需要根据 DNS 记录推理真实公网服务 IP，"
-                    "排除仅用于 NS 的地址、明显 CNAME/CDN 接入、WAF/代理、保留地址段，并总结有价值线索。"
-                    "回答必须以如下机器可读区块开头，供后续 nmap 使用：\n"
-                    "NMAP_TARGET_IPS\n"
-                    "- <ip> | <high|medium|low> | <简短理由>\n"
-                    "END_NMAP_TARGET_IPS\n"
-                    "如果没有可信目标，也必须输出空的 NMAP_TARGET_IPS 区块。"
+                    "你是互联网资产测绘分析助手。只评估已经过严格 DNS 过滤的直接 A/AAAA 候选，"
+                    "未知、证据不足、CDN/WAF/代理风险均不得放行。回答必须以如下机器可读区块开头：\n"
+                    "ORIGIN_IP_DECISIONS\n"
+                    "- <ip> | <include|exclude> | <high|medium|low> | <简短理由>\n"
+                    "END_ORIGIN_IP_DECISIONS\n"
+                    "只有 include 且 high 的候选会进入后续主动扫描；没有可信候选时输出空区块。"
                 ),
             },
             {

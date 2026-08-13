@@ -15,7 +15,6 @@ PYTHON_IMPORTS = {
     "dnspython": "dns",
     "httpx": "httpx",
     "openpyxl": "openpyxl",
-    "Pillow": "PIL",
     "python-docx": "docx",
     "PyYAML": "yaml",
     "sqlmodel": "sqlmodel",
@@ -60,11 +59,8 @@ class EnvironmentCheckService:
         ]
 
     def _external_tools(self) -> list[dict[str, Any]]:
-        resolver = ToolResolver(self.config.tools)
-        results = resolver.check_environment()
-        sources = {source.lower().strip() for source in self.config.port_scan.sources_enabled if source.strip()}
-        if "nmap" not in sources:
-            results = [row for row in results if row.get("name") != "nmap"]
+        resolver = ToolResolver(self.config.tools, self.config.config_dir)
+        results = resolver.check_environment(include_httpx=True)
         return results
 
     def _browser(self) -> list[dict[str, Any]]:
@@ -148,14 +144,14 @@ class EnvironmentCheckService:
     def _files(self) -> list[dict[str, Any]]:
         checks = [
             (
-                "enscan.script",
-                Path(self.config.enscan.script),
-                "Ensure assetmap/collectors/tyc_invest_crawler.py exists.",
+                "domain_mapping.dnsx_wordlist",
+                self.config.resolve_path(self.config.domain_mapping.dnsx_wordlist),
+                "Place a subdomain wordlist at domain_mapping.dnsx_wordlist or update config.yaml.",
             ),
             (
-                "tools.wordlist",
-                Path(self.config.tools.wordlist),
-                "Place a subdomain wordlist at tools.wordlist or update config.yaml.",
+                "domain_mapping.subfinder_provider_config",
+                self.config.resolve_path(self.config.domain_mapping.subfinder_provider_config),
+                "Copy config/subfinder/provider-config.example.yaml to the configured path and add provider keys.",
             ),
         ]
         return [
@@ -166,16 +162,16 @@ class EnvironmentCheckService:
     def _configuration(self) -> list[dict[str, Any]]:
         results = [
             self._result(
-                "enscan.tycid",
-                _configured_secret(self.config.enscan.tycid),
-                "configured" if _configured_secret(self.config.enscan.tycid) else "missing or placeholder",
-                "Set enscan.tycid in config.yaml.",
+                "enterprise_discovery.tycid",
+                _configured_secret(self.config.enterprise_discovery.tycid),
+                "configured" if _configured_secret(self.config.enterprise_discovery.tycid) else "missing or placeholder",
+                "Set enterprise_discovery.tycid in config.yaml.",
             ),
             self._result(
-                "enscan.auth_token",
-                _configured_secret(self.config.enscan.auth_token),
-                "configured" if _configured_secret(self.config.enscan.auth_token) else "missing or placeholder",
-                "Set enscan.auth_token in config.yaml.",
+                "enterprise_discovery.auth_token",
+                _configured_secret(self.config.enterprise_discovery.auth_token),
+                "configured" if _configured_secret(self.config.enterprise_discovery.auth_token) else "missing or placeholder",
+                "Set enterprise_discovery.auth_token in config.yaml.",
             ),
         ]
         if self.config.ai.enabled:
@@ -189,19 +185,15 @@ class EnvironmentCheckService:
             )
         else:
             results.append(self._result("ai", True, "disabled", ""))
-        sources = {source.lower().strip() for source in self.config.port_scan.sources_enabled if source.strip()}
-        if "fofa" in sources:
-            fofa_ok = _configured_secret(self.config.fofa.email) and _configured_secret(self.config.fofa.api_key)
-            results.append(
-                self._result(
-                    "fofa.credentials",
-                    fofa_ok,
-                    "configured" if fofa_ok else "enabled but missing or placeholder",
-                    "Set fofa.email and fofa.api_key in config.yaml, or remove fofa from port_scan.sources_enabled.",
-                )
+        fofa_ok = _configured_secret(self.config.fofa.email) and _configured_secret(self.config.fofa.api_key)
+        results.append(
+            self._result(
+                "fofa.credentials",
+                fofa_ok,
+                "configured" if fofa_ok else "missing or placeholder",
+                "Set fofa.email and fofa.api_key in config.yaml.",
             )
-        else:
-            results.append(self._result("fofa", True, "disabled", ""))
+        )
         return results
 
     def _result(self, name: str, ok: bool, detail: str, suggestion: str) -> dict[str, Any]:

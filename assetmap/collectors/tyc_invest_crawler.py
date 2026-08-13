@@ -19,7 +19,6 @@ import logging
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -47,6 +46,12 @@ ABNORMAL_STATUS = {
     "经营异常",
     "严重违法失信",
 }
+
+# Enterprise discovery uses a deliberately conservative, fixed request policy.
+# These values are implementation details rather than user-facing scan options.
+FIXED_REQUEST_DELAY_SECONDS = 0.2
+FIXED_REQUEST_TIMEOUT_SECONDS = 6
+FIXED_MAX_RETRIES = 3
 
 
 class TYCError(RuntimeError):
@@ -152,17 +157,16 @@ class QueueItem:
 class CrawlOptions:
     threshold: float = 50.0
     max_depth: int = 0
-    skip_abnormal: bool = False
-    asset_workers: int = 1
+    skip_abnormal: bool = True
 
 
 @dataclass
 class ClientOptions:
     tycid: str = ""
     auth_token: str = ""
-    timeout: int = 20
-    delay: float = 1.0
-    max_retries: int = 3
+    timeout: int = FIXED_REQUEST_TIMEOUT_SECONDS
+    delay: float = FIXED_REQUEST_DELAY_SECONDS
+    max_retries: int = FIXED_MAX_RETRIES
     proxy: str | None = None
 
 
@@ -196,9 +200,9 @@ class TianyanchaClient:
         tycid: str,
         auth_token: str,
         *,
-        timeout: int = 20,
-        delay: float = 1.0,
-        max_retries: int = 3,
+        timeout: int = FIXED_REQUEST_TIMEOUT_SECONDS,
+        delay: float = FIXED_REQUEST_DELAY_SECONDS,
+        max_retries: int = FIXED_MAX_RETRIES,
         proxy: str | None = None,
     ) -> None:
         if not tycid or not auth_token:
@@ -553,8 +557,6 @@ def create_result(root: QueueItem, options: CrawlOptions) -> CrawlResult:
 def fetch_company_payload(
     client: TianyanchaClient,
     pid: str,
-    *,
-    asset_workers: int = 1,
 ) -> tuple[
     CompanyBasic,
     list[Investment],
@@ -572,28 +574,13 @@ def fetch_company_payload(
         "mini_programs": lambda: client.list_mini_programs(pid),
     }
 
-    if asset_workers <= 1:
-        return (
-            basic,
-            tasks["investments"](),
-            tasks["icp_records"](),
-            tasks["apps"](),
-            tasks["wechat_accounts"](),
-            tasks["mini_programs"](),
-        )
-
-    max_workers = max(1, min(asset_workers, len(tasks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {name: executor.submit(task) for name, task in tasks.items()}
-        results = {name: future.result() for name, future in futures.items()}
-
     return (
         basic,
-        results["investments"],
-        results["icp_records"],
-        results["apps"],
-        results["wechat_accounts"],
-        results["mini_programs"],
+        tasks["investments"](),
+        tasks["icp_records"](),
+        tasks["apps"](),
+        tasks["wechat_accounts"](),
+        tasks["mini_programs"](),
     )
 
 
@@ -643,7 +630,6 @@ def crawl_company_tree(
             ) = fetch_company_payload(
                 client,
                 item.pid,
-                asset_workers=options.asset_workers,
             )
         except TYCRiskVerificationError as exc:
             _set_crawler_state(result, deque([item, *queue]), completed, status="blocked")
@@ -692,7 +678,7 @@ def crawl_company_tree(
         for investment in investments:
             if not investment.pid:
                 continue
-            if investment.percent_value is None or investment.percent_value <= options.threshold:
+            if investment.percent_value is None or investment.percent_value < options.threshold:
                 continue
             if options.skip_abnormal and investment.reg_status in ABNORMAL_STATUS:
                 continue
@@ -1393,14 +1379,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auth-token", default="", help="Tianyancha X-Auth-Token")
     parser.add_argument("--threshold", type=float, default=50.0, help="Drill down investments greater than this percent")
     parser.add_argument("--max-depth", type=int, default=0, help="0 means unlimited")
-    parser.add_argument("--skip-abnormal", action="store_true", help="Skip abnormal investment targets like cancelled companies")
-    parser.add_argument("--asset-workers", type=int, default=1, help="Parallel requests per company for investments/assets")
     parser.add_argument("--output", type=Path, default=Path("output/tyc_result.json"), help="JSON output path")
     parser.add_argument("--fresh", action="store_true", help="Ignore an existing output checkpoint and start over")
     parser.add_argument("--csv-dir", type=Path, help="Optional directory for companies/investments/icp CSV files")
-    parser.add_argument("--delay", type=float, default=1.0, help="Delay in seconds between requests")
-    parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout in seconds")
-    parser.add_argument("--proxy", help="Optional HTTP/HTTPS proxy URL")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logs")
     return parser
 
@@ -1417,15 +1398,10 @@ def main(argv: list[str] | None = None) -> int:
     client_options = ClientOptions(
         tycid=args.tycid or "",
         auth_token=args.auth_token or "",
-        delay=args.delay,
-        timeout=args.timeout,
-        proxy=args.proxy,
     )
     crawl_options = CrawlOptions(
         threshold=args.threshold,
         max_depth=args.max_depth,
-        skip_abnormal=args.skip_abnormal,
-        asset_workers=args.asset_workers,
     )
     run_options = RunOptions(
         name=args.name,

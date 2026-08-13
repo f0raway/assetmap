@@ -100,7 +100,7 @@ def register(app: typer.Typer) -> None:
     ):
         """按补全计划预演或执行下一轮补全动作。"""
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             result = ImprovementPlanService(session, config).write(
@@ -155,7 +155,8 @@ def _coalesce_improve_actions(actions: list[dict]) -> list[dict]:
         "子域名/DNS": 1,
         "端口发现": 2,
         "服务识别/URL": 3,
-        "URL视觉识别": 4,
+        "URL页面识别": 4,
+        "URL视觉识别": 4,  # 兼容已生成的历史补全计划。
     }
     manual = [action for action in actions if action.get("mode") == "manual"]
     deliver = [action for action in actions if action.get("phase") == "报告交付"]
@@ -212,15 +213,7 @@ def _execute_improve_actions(
                     rerun_subdomain_tools=True,
                 )
         elif phase == "端口发现":
-            original_sources = list(config.port_scan.sources_enabled)
-            override_sources = _sources_from_action_command(command)
-            if override_sources:
-                config.port_scan.sources_enabled = override_sources
-                progress(f"[improve] temporary port sources -> {','.join(override_sources)}")
-            try:
-                _run_pipeline(session, config, task_id, progress=progress, from_stage="port-scan", rerun_ports=True)
-            finally:
-                config.port_scan.sources_enabled = original_sources
+            _run_pipeline(session, config, task_id, progress=progress, from_stage="port-scan", rerun_ports=True)
         elif phase == "服务识别/URL":
             if action.get("mode") == "manual":
                 if not review_workorder_written:
@@ -230,7 +223,7 @@ def _execute_improve_actions(
                     progress("[improve] review workorder already generated; skip duplicate manual review action")
             else:
                 _run_pipeline(session, config, task_id, progress=progress, from_stage="classify", rerun_classify=True)
-        elif phase == "URL视觉识别":
+        elif phase in {"URL页面识别", "URL视觉识别"}:
             if action.get("mode") == "manual":
                 if not review_workorder_written:
                     _write_review_workorder_for_improve(session, config, task_id, progress)
@@ -257,13 +250,3 @@ def _write_review_workorder_for_improve(session, config: AppConfig, task_id: int
     result = ReviewWorkOrderService(session, config).write(task_id, path, force=True)
     progress(f"[improve] review workorder -> {result.path} (items={result.total_items})")
     progress(f"[improve] fill review_status, then run: assetmap import-review {task_id} --file {path}")
-
-
-def _sources_from_action_command(command: str) -> list[str] | None:
-    parts = command.split()
-    if "--sources" not in parts:
-        return None
-    index = parts.index("--sources")
-    if index + 1 >= len(parts):
-        return None
-    return _csv_values(parts[index + 1])

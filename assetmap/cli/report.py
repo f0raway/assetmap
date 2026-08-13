@@ -24,7 +24,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             service = ReportService(session, config, progress=typer.echo)
@@ -46,11 +46,12 @@ def register(app: typer.Typer) -> None:
         rerun_ai: bool = typer.Option(False, "--rerun-ai", help="强制重算报告中的 AI 分块分析。"),
         strict: bool = typer.Option(False, "--strict", help="存在质量警告时不生成交付包。"),
         include_partial_gaps: bool = typer.Option(True, "--include-partial-gaps/--no-include-partial-gaps", help="待补充模板包含部分覆盖单位。"),
+        include_internal_evidence: bool = typer.Option(False, "--include-internal-evidence", help="额外打包原始 HTML、审计日志和复核工作单；默认客户包不包含这些内部材料。"),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         """生成报告、执行质量门禁、打包并校验交付压缩包。"""
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             typer.echo("[deliver] step 1/4 report")
@@ -82,6 +83,7 @@ def register(app: typer.Typer) -> None:
                 reports_dir=reports_dir,
                 output_dir=output_dir,
                 include_partial_gaps=include_partial_gaps,
+                include_internal_evidence=include_internal_evidence,
                 strict=strict,
             )
             typer.echo(f"[deliver] package directory -> {package.package_dir}")
@@ -108,7 +110,7 @@ def register(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             result = DeliveryQualityService(session, config).check(task_id, output_dir=output_dir)
@@ -128,10 +130,11 @@ def register(app: typer.Typer) -> None:
         no_gap_template: bool = typer.Option(False, "--no-gap-template", help="不在交付包中生成待补充资产模板。"),
         no_review_workorder: bool = typer.Option(False, "--no-review-workorder", help="不在交付包中生成复核工作单。"),
         include_partial_gaps: bool = typer.Option(True, "--include-partial-gaps/--no-include-partial-gaps", help="待补充模板包含部分覆盖单位。"),
+        include_internal_evidence: bool = typer.Option(False, "--include-internal-evidence", help="额外打包原始 HTML、审计日志和复核工作单；默认客户包不包含这些内部材料。"),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
     ):
         config = load_config(config_path)
-        engine = create_db_and_engine(config.database.url)
+        engine = create_db_and_engine(config.database_url)
         session = get_session(engine)
         try:
             result = DeliveryPackageService(session, config).package(
@@ -141,6 +144,7 @@ def register(app: typer.Typer) -> None:
                 include_gap_template=not no_gap_template,
                 include_review_workorder=not no_review_workorder,
                 include_partial_gaps=include_partial_gaps,
+                include_internal_evidence=include_internal_evidence,
                 strict=strict,
             )
             typer.echo(f"Delivery package directory: {result.package_dir}")

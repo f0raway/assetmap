@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from assetmap.config import load_config, write_sample_config
+from assetmap.config import load_config, resolve_config_path, write_sample_config
 
 
 def test_write_and_load_sample_config(tmp_path: Path):
@@ -8,43 +8,32 @@ def test_write_and_load_sample_config(tmp_path: Path):
     write_sample_config(config_path)
     content = config_path.read_text(encoding="utf-8")
     config = load_config(config_path)
-    assert config.org.control_threshold == 0.47
-    assert "# assetmap 深度测绘配置示例。" in content
-    assert "# 唯一的主扫描命令" in content
-    assert config.enscan.script.endswith("tyc_invest_crawler.py")
-    assert config.enscan.script.startswith("assetmap/collectors")
-    assert config.enscan.tycid == "YOUR_TYCID"
-    assert config.enscan.auth_token == "YOUR_TYC_AUTH_TOKEN"
-    assert config.enscan.request_delay_seconds == 1.0
-    assert config.enscan.request_timeout_seconds == 20
-    assert config.enscan.asset_workers == 5
-    assert config.enscan.verbose is False
-    assert config.tools.subdomain_tools_enabled == ["subfinder", "dnsx"]
-    assert config.tools.subdomain_tool_timeout_seconds == 5400
-    assert config.tools.subdomain_tool_max_output_lines == 200000
-    assert "-wt 5" in config.tools.dnsx_command
-    assert "-auto-wildcard" not in config.tools.dnsx_command
-    assert "-resp" not in config.tools.dnsx_command
-    assert "-timeout" not in config.tools.dnsx_command
-    assert config.tools.wordlist.endswith("Subdomain.txt")
+    assert config.enterprise_discovery.control_threshold == 0.47
+    assert "# assetmap 深度测绘配置。" in content
+    assert config.enterprise_discovery.tycid == "YOUR_TYCID"
+    assert config.enterprise_discovery.auth_token == "YOUR_TYC_AUTH_TOKEN"
+    assert config.enterprise_discovery.max_depth == 10
+    assert "request_delay_seconds" not in content
+    assert "asset_workers" not in content
+    assert config.domain_mapping.subfinder_provider_config.endswith("provider-config.yaml")
+    assert config.domain_mapping.dnsx_wordlist.endswith("Subdomain.txt")
     assert "-p-" in config.tools.nmap_command
-    assert "--version-intensity 5" in config.tools.nmap_command
     assert "{targets_file}" in config.tools.nmap_command
     assert "{xml_output}" in config.tools.nmap_command
     assert "-iL {targets_file}" in config.tools.nmap_command
-    assert config.tools.nmap_max_workers == 3
-    assert config.tools.nmap_timeout_seconds == 5400
-    assert "-sV" in config.tools.nmap_service_detect_command
-    assert "{ports}" in config.tools.nmap_service_detect_command
-    assert config.port_scan.sources_enabled == ["nmap", "fofa"]
-    assert config.port_scan.target_sources_enabled == ["ai", "manual", "dns_public"]
-    assert config.fofa.base_url == "https://fofa.info"
+    assert "-sV" in config.tools.nmap_command
+    assert "--script-timeout 60s" in config.tools.nmap_command
+    assert "host-timeout" not in config.tools.nmap_command
+    assert "-json" in config.tools.httpx_command
+    assert "{input_file}" in config.tools.httpx_command
+    assert "-t 30" in config.tools.httpx_command
+    assert "-rl 100" in config.tools.httpx_command
+    assert "httpx_command" not in content
     assert config.fofa.email == "YOUR_FOFA_EMAIL"
     assert config.fofa.api_key == "YOUR_FOFA_API_KEY"
-    assert "ip" in config.fofa.fields
-    assert config.dns.max_workers == 50
-    assert config.fofa.size == 1000
-    assert config.fofa.full is True
+    assert not hasattr(config, "port_scan")
+    assert not hasattr(config.tools, "nmap_timeout_seconds")
+    assert not hasattr(config.fofa, "base_url")
     assert config.ai.enabled is True
     assert config.ai.max_dns_records == 5000
     assert config.ai.max_prompt_chars == 120000
@@ -57,14 +46,14 @@ def test_write_and_load_sample_config(tmp_path: Path):
     assert "max_prompt_chars" not in content
     assert "max_completion_tokens" not in content
     assert "Chrome" in config.web_probe.user_agent
-    assert config.web_probe.max_workers == 50
-    assert config.url_discovery.browser_channel == ""
+    assert not hasattr(config.web_probe, "max_body_bytes")
+    assert not hasattr(config.web_probe, "max_workers")
+    assert not hasattr(config.web_probe, "max_domains_per_ip")
     assert config.url_discovery.timeout_seconds == 15
     assert config.url_discovery.page_hard_timeout_seconds == 60
     assert config.url_discovery.ai_timeout_seconds == 240
-    assert config.url_discovery.visual_max_pages == 200
-    assert config.url_discovery.screenshot_full_page is True
-    assert config.url_discovery.screenshot_detail == "high"
+    assert not hasattr(config.url_discovery, "visual_max_pages")
+    assert "visual_max_pages" not in content
 
 
 def test_write_sample_config_can_keep_existing_file(tmp_path: Path):
@@ -74,6 +63,20 @@ def test_write_sample_config_can_keep_existing_file(tmp_path: Path):
     write_sample_config(config_path, overwrite=False)
 
     assert "custom.db" in config_path.read_text(encoding="utf-8")
+
+
+def test_default_config_resolves_to_project_root_when_called_in_package_dir(tmp_path: Path, monkeypatch):
+    project = tmp_path / "project"
+    package_dir = project / "assetmap"
+    package_dir.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("[project]\nname = 'assetmap'\n", encoding="utf-8")
+    (project / "config.yaml").write_text("database:\n  url: sqlite:///data/assetmap.db\n", encoding="utf-8")
+    monkeypatch.chdir(package_dir)
+
+    config = load_config()
+
+    assert resolve_config_path() == project / "config.yaml"
+    assert config.database_url == f"sqlite:///{project / 'data' / 'assetmap.db'}"
 
 
 def test_legacy_nmap_batch_template_is_migrated(tmp_path: Path):
@@ -96,15 +99,12 @@ def test_config_strips_secrets_and_clamps_risky_limits(tmp_path: Path):
     config_path.write_text(
         "\n".join(
             [
-                "enscan:",
+                "enterprise_discovery:",
                 "  tycid: '  tycid-value  '",
                 '  auth_token: "  token-value\\n  "',
                 "fofa:",
                 "  email: '  user@example.com  '",
                 "  api_key: '  fofa-key  '",
-                "dns:",
-                "  lifetime_seconds: 1000",
-                "  nameservers: [' 223.5.5.5 ', '']",
                 "ai:",
                 "  api_key: '  ai-key  '",
                 "  max_completion_tokens: 100000",
@@ -115,11 +115,29 @@ def test_config_strips_secrets_and_clamps_risky_limits(tmp_path: Path):
 
     config = load_config(config_path)
 
-    assert config.enscan.tycid == "tycid-value"
-    assert config.enscan.auth_token == "token-value"
+    assert config.enterprise_discovery.tycid == "tycid-value"
+    assert config.enterprise_discovery.auth_token == "token-value"
     assert config.fofa.email == "user@example.com"
     assert config.fofa.api_key == "fofa-key"
-    assert config.dns.lifetime_seconds == 60.0
-    assert config.dns.nameservers == ["223.5.5.5"]
     assert config.ai.api_key == "ai-key"
     assert config.ai.max_completion_tokens == 8192
+
+
+def test_legacy_enscan_and_org_configuration_is_migrated(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "org:\n"
+        "  control_threshold: 0.55\n"
+        "  max_depth: 7\n"
+        "enscan:\n"
+        "  tycid: legacy-tycid\n"
+        "  auth_token: legacy-token\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.enterprise_discovery.tycid == "legacy-tycid"
+    assert config.enterprise_discovery.auth_token == "legacy-token"
+    assert config.enterprise_discovery.control_threshold == 0.55
+    assert config.enterprise_discovery.max_depth == 7

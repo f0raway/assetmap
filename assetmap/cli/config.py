@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import webbrowser
 
 import httpx
 import typer
@@ -24,13 +26,13 @@ def register(app: typer.Typer) -> None:
         path = write_sample_config(config_path, overwrite=force)
         manual_template = write_manual_asset_template()
         config = load_config(path)
-        create_db_and_engine(config.database.url)
+        create_db_and_engine(config.database_url)
         if config_exists and not force:
             typer.echo(f"Config exists, kept unchanged: {path}")
         else:
             typer.echo(f"Initialized config: {path}")
         typer.echo(f"Initialized manual asset template: {manual_template}")
-        typer.echo(f"Initialized database: {config.database.url}")
+        typer.echo(f"Initialized database: {config.database_url}")
 
     @app.command("configure")
     def configure_command(
@@ -44,12 +46,33 @@ def register(app: typer.Typer) -> None:
         if not success:
             raise typer.Exit(1)
 
+    @app.command("ui")
+    def ui_command(
+        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="配置文件路径。"),
+        port: int = typer.Option(8765, "--port", min=1024, max=65535, help="本机控制台端口。"),
+        no_open: bool = typer.Option(False, "--no-open", help="只启动服务，不自动打开浏览器。"),
+    ):
+        """启动仅本机可访问的图形控制台。"""
+        try:
+            import uvicorn
+            from assetmap.web.app import create_app
+        except ImportError as exc:
+            typer.echo("图形控制台依赖未安装。请执行：pip install -e \".[web]\"", err=True)
+            raise typer.Exit(1) from exc
+        url = f"http://127.0.0.1:{port}"
+        if not no_open:
+            timer = threading.Timer(0.8, lambda: webbrowser.open(url))
+            timer.daemon = True
+            timer.start()
+        typer.echo(f"图形控制台已启动：{url}（仅本机可访问）")
+        uvicorn.run(create_app(config_path), host="127.0.0.1", port=port, log_level="warning")
+
     @app.command("install-tools")
     def install_tools_command(
         tools: list[str] | None = typer.Argument(None, help="要安装的工具列表，默认全部安装"),
         tools_dir: Path = typer.Option(Path("tools"), "--tools-dir", help="工具安装目录"),
     ):
-        """安装外部工具：subfinder, dnsx, nmap"""
+        """安装外部工具：subfinder, dnsx, nmap, httpx"""
         from assetmap.services.runtime.tool_install import ToolInstallService
 
         service = ToolInstallService(tools_dir=tools_dir, progress=typer.echo)
@@ -84,9 +107,9 @@ def register(app: typer.Typer) -> None:
                 categories["python"].append(result)
             elif name.startswith("browser"):
                 categories["browser"].append(result)
-            elif name in ("subfinder", "dnsx", "nmap"):
+            elif name in ("subfinder", "dnsx", "nmap", "httpx"):
                 categories["tool"].append(result)
-            elif name in ("enscan.script", "tools.wordlist"):
+            elif name in {"domain_mapping.dnsx_wordlist", "domain_mapping.subfinder_provider_config"}:
                 categories["file"].append(result)
             else:
                 categories["config"].append(result)

@@ -174,7 +174,7 @@ class ImprovementPlanService:
                     "开放端口存在 FOFA-only 被动证据，建议主动验证后形成交叉证据。"
                     if port_active_validation_needed
                     else "存在候选公网 IP 缺少端口发现证据。",
-                    f"assetmap nmap-scan {task.id} --sources nmap,fofa --rerun"
+                    f"assetmap nmap-scan {task.id} --rerun"
                     if port_active_validation_needed
                     else f"assetmap run {task.id} --from-stage port-scan --rerun-ports",
                     "对 FOFA-only 端口执行一次精确主动 nmap 验证，并与被动证据合并。"
@@ -204,18 +204,18 @@ class ImprovementPlanService:
             )
             sequence += 1
 
-        if self._has_gap(coverage_rows, "URL视觉识别"):
+        if self._has_gap(coverage_rows, "URL页面识别"):
             actions.append(
                 self._action(
                     sequence,
-                    "URL视觉识别",
+                    "URL页面识别",
                     "automatic" if visual_retry_needed else "manual",
                     "medium" if visual_retry_needed else "low",
-                    f"{len(visual_review)} 个 Web 入口需要视觉复核或曾使用降级识别。",
+                    f"{len(visual_review)} 个 Web 入口需要页面复核或曾使用降级识别。",
                     f"assetmap url-discover {task.id} --retry-failed" if visual_retry_needed else f"assetmap review-workorder {task.id} --output data/review_workorder.task_{task.id}.yaml --force",
-                    "只重试失败或缺失视觉识别的页面；对 HTTP 降级页面保留复核清单。"
+                    "只重试失败或缺失页面识别的入口；对 HTTP 降级页面保留复核清单。"
                     if visual_retry_needed
-                    else "不重跑截图流程，直接按复核工作单人工核对低置信度、低价值错误/拦截页、降级识别和编码异常页面；填写 review_status 后导入复核结论。",
+                    else "不重跑页面识别流程，直接按复核工作单人工核对低置信度、低价值错误/拦截页、降级识别和编码异常页面；填写 review_status 后导入复核结论。",
                     samples=[row.get("URL") for row in visual_review[:10]],
                     follow_up=None if visual_retry_needed else f"assetmap import-review {task.id} --file data/review_workorder.task_{task.id}.yaml",
                 )
@@ -279,7 +279,7 @@ class ImprovementPlanService:
             f"- 资产数量：{metrics['assets']}",
             f"- 开放端口：{metrics['open_ports']}",
             f"- Web入口：{metrics['web_entrypoints']}",
-            f"- 视觉识别覆盖：{metrics['web_visual_coverage']}",
+            f"- 页面识别覆盖：{metrics['web_visual_coverage']}",
             f"- 覆盖缺口项：{metrics['coverage_gap_items']}",
             "",
             "建议动作：",

@@ -16,11 +16,9 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm
 from docx.shared import Inches, Pt, RGBColor
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, PieChart, Reference
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from sqlmodel import Session, select
@@ -121,11 +119,10 @@ BORDER_COLOR = "D9E2F3"
 REPORT_ANALYSIS_TITLES = {
     "report_dns": "DNS与域名解析分析",
     "report_ports": "端口与服务暴露分析",
-    "report_web": "Web资产视觉识别分析",
+    "report_web": "Web资产页面识别分析",
     "report_summary": "总体暴露面结论与处置建议",
 }
 REPORT_ANALYSIS_CACHE_VERSION = "report-analysis-v2"
-MAX_EXCEL_SCREENSHOT_THUMBNAILS: int | None = None
 LOW_VALUE_WEB_TITLE_MARKERS = (
     "400",
     "403",
@@ -140,6 +137,25 @@ LOW_VALUE_WEB_TITLE_MARKERS = (
     "nginx",
     "apache tomcat",
 )
+# This is the public CJK family name exposed by macOS.  The explicit OOXML
+# East-Asian declaration gives Word a deterministic preferred font while other
+# systems may substitute their local CJK font.
+DOCUMENT_CJK_FONT = "Hiragino Sans GB W3"
+
+
+def _set_east_asian_font(element: Any, font_name: str = DOCUMENT_CJK_FONT) -> None:
+    """Set the OOXML East-Asian font explicitly instead of relying on Word defaults."""
+    r_pr = element.get_or_add_rPr()
+    r_fonts = r_pr.rFonts
+    if r_fonts is None:
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.insert(0, r_fonts)
+    r_fonts.set(qn("w:eastAsia"), font_name)
+
+
+def _set_document_run_font(run, font_name: str = DOCUMENT_CJK_FONT) -> None:
+    run.font.name = font_name
+    _set_east_asian_font(run._element, font_name)
 
 
 @dataclass
@@ -295,8 +311,9 @@ class ReportService:
         )
         remediation_rows = self._remediation_rows(risk_rows)
         key_asset_rows = self._key_asset_rows(risk_rows, port_target_rows, web_rows)
-        key_web_rows = self._top_web_rows(web_rows, risk_rows)[:50]
-        screenshot_evidence_rows = self._screenshot_evidence_rows(web_rows, risk_rows)
+        html_evidence_rows = self._html_evidence_rows(web_rows, risk_rows)
+        customer_web_rows = self._customer_web_rows(web_rows, html_evidence_rows)
+        key_web_rows = self._top_web_rows(customer_web_rows, risk_rows)[:50]
         stats = self._stats(
             bundle,
             port_rows,
@@ -326,9 +343,13 @@ class ReportService:
             "port_target_rows": port_target_rows,
             "unit_asset_rows": unit_asset_rows,
             "key_asset_rows": key_asset_rows,
+            # Keep raw paths and diagnostic messages only in the in-memory
+            # context used by internal processing.  Customer-facing Word/Excel
+            # artifacts use the redacted projection below.
             "web_rows": web_rows,
+            "customer_web_rows": customer_web_rows,
             "key_web_rows": key_web_rows,
-            "screenshot_evidence_rows": screenshot_evidence_rows,
+            "html_evidence_rows": html_evidence_rows,
             "service_audit_rows": service_audit_rows,
             "url_coverage_rows": url_coverage_rows,
             "visual_review_rows": visual_review_rows,
@@ -855,7 +876,7 @@ class ReportService:
                     confidence_value = self._float_or_none(confidence)
                     confidence = max(confidence_value or 0, 0.45 if self._is_low_value_title(fallback_title) else 0.55)
             fallback_category = self._visual_fallback_category(visual, service)
-            fallback_reason = visual.get("screenshot_error") or visual.get("ai_error") or ""
+            fallback_reason = visual.get("rendered_html_error") or visual.get("screenshot_error") or visual.get("ai_error") or ""
             unit = (
                 self._unit_for_host(entry.get("host"), domain_units)
                 or ip_units.get(entry.get("target_ip") or "")
@@ -883,11 +904,11 @@ class ReportService:
                     "服务端": entry.get("server") or "",
                     "内容类型": entry.get("content_type") or "",
                     "主机模式": service.get("host_mode") or "",
-                    "识别方式": visual.get("analysis_method") or ("screenshot_ai" if visual else ""),
+                    "识别方式": visual.get("analysis_method") or ("rendered_html_ai" if visual else ""),
                     "识别置信度": confidence,
                     "降级类型": fallback_category,
                     "降级原因": _short(fallback_reason, 800),
-                    "截图": visual.get("screenshot_path") or evidence.get("visual_analysis_screenshot_path") or "",
+                    "HTML证据": visual.get("rendered_html_path") or evidence.get("visual_analysis_rendered_html_path") or "",
                     "分析错误": "" if visual else evidence.get("visual_analysis_error") or "",
                 }
             self._apply_visual_attestation(row, review_attestations or {}, key)
@@ -939,13 +960,13 @@ class ReportService:
         if not visual or visual.get("analysis_method") != "http_probe_fallback":
             return ""
         service = service or {}
-        error = _text(visual.get("screenshot_error") or visual.get("ai_error")).lower()
+        error = _text(visual.get("rendered_html_error") or visual.get("screenshot_error") or visual.get("ai_error")).lower()
         if service.get("host_mode") == "passive_fofa":
             return "被动FOFA证据"
         if "download is starting" in error:
             return "下载响应"
         if "hard timeout" in error or "timeout" in error:
-            return "截图超时"
+            return "页面渲染超时"
         if "err_empty_response" in error or "server disconnected" in error:
             return "空响应/连接断开"
         if "err_connection_closed" in error or "connection closed" in error:
@@ -1032,11 +1053,11 @@ class ReportService:
                     "HTTP状态分布": self._http_status_summary(responded),
                     "标题": service.get("title") or "",
                     "应用线索": service.get("app_name") or "",
-                    "视觉识别数量": len(visual_rows),
-                    "截图数量": sum(1 for item in visual_rows if item.get("截图")),
+                    "页面识别数量": len(visual_rows),
+                    "HTML证据数量": sum(1 for item in visual_rows if item.get("HTML证据")),
                     "AI识别系统": self._join_unique((item.get("AI识别系统") for item in visual_rows), limit=8),
                     "网站用途": self._join_unique((item.get("网站用途") for item in visual_rows), limit=8),
-                    "截图样例": self._join_unique((item.get("截图") for item in visual_rows), limit=5),
+                    "HTML证据样例": self._join_unique((item.get("HTML证据") for item in visual_rows), limit=5),
                     "分类依据": self._service_classification_reason(kind, service, probes, entry_count),
                     "建议动作": self._service_audit_action(review_priority, kind, web_like, entry_count, service.get("host_mode") or ""),
                 }
@@ -1116,7 +1137,7 @@ class ReportService:
                     "URL入口样例": ", ".join((entry.get("normalized_url") or "") for entry in entries[:10]),
                     "来源": coverage_source,
                     "覆盖结论": coverage_conclusion,
-                    "建议动作": "继续视觉识别和风险复核。" if entries else "复核代表URL、Host绑定、HTTP状态过滤和URL入口生成规则。",
+                    "建议动作": "继续页面识别和风险复核。" if entries else "复核代表URL、Host绑定、HTTP状态过滤和URL入口生成规则。",
                 }
             self._apply_review_attestation(row, review_attestations or {}, "url_entrypoint", row.get("URL入口样例") or f"{row.get('IP')}:{row.get('端口')}")
             rows.append(row)
@@ -1183,9 +1204,9 @@ class ReportService:
             low_value_page = self._is_low_value_visual_row(row)
             reasons = []
             if error:
-                reasons.append("截图或AI识别失败")
+                reasons.append("页面渲染或AI识别失败")
             if not method:
-                reasons.append("缺少视觉识别结果")
+                reasons.append("缺少页面识别结果")
             elif method == "http_probe_fallback":
                 category = row.get("降级类型") or "HTTP探测降级"
                 reasons.append(f"HTTP探测信息降级识别({category})")
@@ -1219,7 +1240,7 @@ class ReportService:
                     "降级原因": row.get("降级原因") or "",
                     "复核原因": "；".join(reasons),
                     "建议动作": self._visual_review_action(priority, method, error, review_type),
-                    "截图": row.get("截图") or "",
+                    "HTML证据": row.get("HTML证据") or "",
                     "分析错误": error,
                 }
             self._apply_review_attestation(review_row, review_attestations or {}, "visual_identification", review_row.get("URL") or "")
@@ -1261,12 +1282,12 @@ class ReportService:
 
     def _visual_review_action(self, priority: str, method: str, error: str, review_type: str = "") -> str:
         if error or not method:
-            return "优先重新截图识别；如页面需要登录态或访问源白名单，补充人工截图和业务用途确认。"
+            return "优先重新加载页面并提取 HTML；如页面需要登录态或访问源白名单，补充人工页面证据和业务用途确认。"
         if review_type == "manual_low_value_page_review":
-            return "确认是否为错误页、默认页、拦截页或停放页；若背后存在真实业务入口，补充正确 Host、URL 或登录态截图。"
+            return "确认是否为错误页、默认页、拦截页或停放页；若背后存在真实业务入口，补充正确 Host、URL 或登录态页面证据。"
         if priority == "中":
-            return "人工核对截图、标题和业务用途，必要时补充系统名称。"
-        return "抽样人工复核降级识别结论，确认是否需要补充截图或登录态验证。"
+            return "人工核对 HTML、标题和业务用途，必要时补充系统名称。"
+        return "抽样人工复核降级识别结论，确认是否需要补充 HTML 或登录态验证。"
 
     def _visual_review_type(self, method: str, error: str, confidence: float | None, row: dict) -> str:
         if error or not method:
@@ -1445,7 +1466,13 @@ class ReportService:
         if isinstance(nmap_task.get("targets"), list):
             task_targets = {str(target) for target in nmap_task["targets"] if target}
         port_target_ips = {row.get("IP") for row in port_target_rows if row.get("IP")}
-        candidate_ips = port_target_ips or task_targets or raw_candidate_ips
+        # The port-scan stage deliberately narrows its scope to confirmed
+        # origin/manual targets.  ``port_target_rows`` also contains every
+        # public DNS observation for audit purposes, so treating it as the
+        # delivery denominator turns CDN/shared/historical addresses into a
+        # false high-severity coverage gap.  Once a port task exists, its
+        # persisted target list is the authoritative scan scope.
+        candidate_ips = task_targets or port_target_ips or raw_candidate_ips
         observed_ips = {
             run.get("target_ip")
             for run in bundle.get("nmap_runs", [])
@@ -1566,12 +1593,12 @@ class ReportService:
                 "建议动作": "对未关联服务资产或缺少 URL 的入口复核重定向、去重规则、服务关联和历史遗留入口。",
             },
             {
-                "环节": "URL视觉识别",
+                "环节": "URL页面识别",
                 "指标": "Web 入口识别覆盖",
                 "结果": f"{len(identified_web)}/{len(web_rows)} 个 Web 入口完成识别，其中 HTTP 降级 {len(fallback_web)} 个",
                 "缺口等级": "中" if missing_visual else ("低" if fallback_web else "无"),
                 "缺口样例": ", ".join((row.get("URL") or "") for row in (missing_visual or fallback_web)[:10]),
-                "建议动作": "对未识别或降级识别页面补充人工复核、截图重试或业务登录态验证。",
+                "建议动作": "对未识别或降级识别页面补充人工复核、重新加载 HTML 或业务登录态验证。",
             },
         ]
 
@@ -1817,13 +1844,13 @@ class ReportService:
             {"指标": "端口目标数量", "结果": stats.get("端口目标数量", 0), "说明": "候选来源、扫描目标或开放端口证据合并后的公网 IP 数量。"},
             {"指标": "开放端口数量", "结果": stats.get("开放端口数量", 0), "说明": "主动/被动端口发现合并后的开放端口数量。"},
             {"指标": "服务复核项", "结果": stats.get("服务复核项", 0), "说明": "疑似 Web 但未形成 Web 资产、未知服务或 Web 服务缺少 URL 的复核项。"},
-            {"指标": "Web入口数量", "结果": stats.get("Web入口数量", 0), "说明": "可用于网站识别和截图取证的 Web 入口数量。"},
+            {"指标": "Web入口数量", "结果": stats.get("Web入口数量", 0), "说明": "可用于网站识别和渲染 HTML 取证的 Web 入口数量。"},
             {"指标": "URL入口复核项", "结果": stats.get("URL入口复核项", 0), "说明": "Web 服务未生成 URL 或 URL 未关联服务资产的复核项。"},
-            {"指标": "Web识别覆盖率", "结果": stats.get("Web识别覆盖率", "0%"), "说明": "已完成截图、复用或降级识别的 Web 入口比例。"},
-            {"指标": "截图AI识别", "结果": method_counts.get("screenshot_ai", 0), "说明": "通过浏览器截图并交由 AI 识别的页面数量。"},
+            {"指标": "Web识别覆盖率", "结果": stats.get("Web识别覆盖率", "0%"), "说明": "已完成 HTML、复用或降级识别的 Web 入口比例。"},
+            {"指标": "HTML AI识别", "结果": method_counts.get("rendered_html_ai", 0), "说明": "通过浏览器加载 HTML 并交由 AI 识别的页面数量。"},
             {"指标": "重复页面复用", "结果": method_counts.get("duplicate_reuse", 0), "说明": "相同页面内容复用已有识别结果的页面数量。"},
-            {"指标": "HTTP降级识别", "结果": method_counts.get("http_probe_fallback", 0), "说明": "截图失败但依据 HTTP 探测信息保留的页面数量。"},
-            {"指标": "视觉复核项", "结果": stats.get("视觉复核项", 0), "说明": "需要人工复核的截图失败、降级识别或低置信度 Web 入口数量。"},
+            {"指标": "HTTP降级识别", "结果": method_counts.get("http_probe_fallback", 0), "说明": "HTML 渲染失败但依据 HTTP 探测信息保留的页面数量。"},
+            {"指标": "页面识别复核项", "结果": stats.get("页面识别复核项", 0), "说明": "需要人工复核的页面渲染失败、降级识别或低置信度 Web 入口数量。"},
             {"指标": "覆盖缺口项", "结果": stats.get("覆盖缺口项", 0), "说明": "仍需复核或补扫的资产链路缺口数量。"},
             {"指标": "高风险项", "结果": stats.get("高风险项", 0), "说明": "建议优先确认与收敛的高风险暴露项。"},
             {"指标": "中风险项", "结果": stats.get("中风险项", 0), "说明": "建议纳入近期加固计划的风险项。"},
@@ -1850,7 +1877,7 @@ class ReportService:
         for asset_type, count in (stats.get("资产类型分布") or {}).items():
             rows.append({"分组": "资产类型", "指标": asset_type, "数值": count, "说明": "基础资产类型分布"})
         for method, count in (stats.get("Web识别方式分布") or {}).items():
-            rows.append({"分组": "Web识别方式", "指标": method, "数值": count, "说明": "URL视觉识别来源分布"})
+            rows.append({"分组": "Web识别方式", "指标": method, "数值": count, "说明": "URL页面识别来源分布"})
         rows.extend(
             [
                 {"分组": "单位覆盖", "指标": "有资产线索单位", "数值": stats.get("有资产线索单位", 0), "说明": "单位覆盖"},
@@ -1918,11 +1945,11 @@ class ReportService:
             "服务识别台账": ("复核", "服务分类、HTTP 探测响应、URL 入口数量和分类依据。"),
             "URL入口覆盖": ("复核", "Web 服务是否生成 URL 入口以及入口关联质量。"),
             "非域名资产": ("溯源", "APP、小程序、公众号、邮箱等非域名类资产。"),
-            "交付审计文件": ("交付", "说明交付包中的审计 JSON、复核模板和质量摘要。"),
-            "重点Web资产": ("先看", "按风险、登录/管理特征和视觉识别质量排序的重点 Web 入口。"),
-            "截图证据": ("证据", "重点 Web 页面截图缩略图、截图路径、识别结论和复核建议。"),
-            "Web资产详情": ("溯源", "每个 URL 的标题、系统名、用途、截图、识别方式和错误信息。"),
-            "视觉复核清单": ("复核", "截图失败、HTTP 降级识别和低置信度页面的复核建议。"),
+            "交付审计文件": ("交付", "说明客户交付包中的质量摘要，以及项目组内部审计包的留存材料。"),
+            "重点Web资产": ("先看", "按风险、登录/管理特征和页面识别质量排序的重点 Web 入口。"),
+            "HTML证据": ("证据", "重点 Web 页面渲染 HTML 路径、识别结论和复核建议。"),
+            "Web资产详情": ("溯源", "每个 URL 的标题、系统名、用途、HTML 证据、识别方式和错误信息。"),
+            "页面识别复核清单": ("复核", "页面渲染失败、HTTP 降级识别和低置信度页面的复核建议。"),
         }
         rows = [
             {
@@ -1937,7 +1964,7 @@ class ReportService:
         return rows
 
     def _navigation_action(self, sheet_name: str, workbook_kind: str) -> str:
-        if sheet_name in {"报告概览", "管理驾驶舱", "风险统计", "重点资产视图", "重点Web资产", "截图证据"}:
+        if sheet_name in {"报告概览", "管理驾驶舱", "风险统计", "重点资产视图", "重点Web资产", "HTML证据"}:
             return "建议交付评审时优先阅读。"
         if "复核" in sheet_name or sheet_name in {"覆盖缺口", "单位覆盖台账", "端口目标台账", "服务识别台账", "URL入口覆盖"}:
             return "用于补充核验、复测和下一轮整改闭环。"
@@ -1947,16 +1974,16 @@ class ReportService:
 
     def _audit_file_rows(self, task_id: int) -> list[dict]:
         rows = [
-            ("quality_summary.txt", "质量门禁摘要", "记录质量状态、覆盖缺口、建议下一步动作。"),
+            ("质量摘要.txt", "质量门禁摘要", "记录面向客户的质量状态、覆盖情况和需关注事项。"),
             (f"task_{task_id}_待补充资产模板.yaml", "人工补充模板", "供复核人员优先补充高/中优先级单位的根域名、子域名、IP、URL、APP、小程序、公众号、邮箱等资产。"),
-            (f"task_{task_id}_复核工作单.yaml", "复核工作单", "列出 DNS、服务、URL、视觉识别等复核对象和续跑命令。"),
+            (f"task_{task_id}_复核工作单.yaml", "复核工作单", "列出 DNS、服务、URL、页面识别等复核对象和续跑命令。"),
             (f"task_{task_id}_补全计划.txt", "补全计划", "把质量告警转换为按优先级排列的下一轮自动/人工补全动作。"),
             (f"task_{task_id}_补全计划.json", "补全计划数据", "补全计划的机器可读版本，便于后续系统自动续跑或审计。"),
             (f"task_{task_id}_端口目标来源.json", "端口目标来源审计", "说明每个候选 IP 来自 AI、手工补充还是 DNS 公网解析。"),
             (f"task_{task_id}_FOFA失败记录.json", "FOFA 失败记录", "仅在 FOFA 查询发生错误时生成，记录失败 IP 和错误原因。"),
             (f"task_{task_id}_HTTP探测审计.json", "HTTP 探测审计", "记录 HTTP 探测响应/失败、状态码分布和失败样例。"),
             (f"task_{task_id}_服务分类审计.json", "服务分类审计", "记录 Web/non_web 分类数量和疑似 Web 但未响应的复核候选。"),
-            (f"task_{task_id}_视觉识别审计.json", "视觉识别审计", "记录截图 AI、重复复用、HTTP 降级、失败和低置信度样例。"),
+            (f"task_{task_id}_Web页面识别审计.json", "Web页面识别审计", "记录渲染 HTML AI、重复复用、HTTP 降级、失败和低置信度样例。"),
             (f"task_{task_id}_报告AI分析审计.json", "报告 AI 分析审计", "记录 DNS、端口、Web、总体结论四个 AI 分块的状态、模型和提示规模。"),
             ("manifest.json", "交付清单", "记录交付包内文件大小和 SHA256，用于归档校验。"),
         ]
@@ -2005,11 +2032,11 @@ class ReportService:
             "服务复核项": sum(1 for row in service_audit_rows if row.get("复核优先级") not in {"", "无"}),
             "Web入口数量": len(web_rows),
             "URL入口复核项": sum(1 for row in url_coverage_rows if row.get("复核优先级") not in {"", "无"}),
-            "已完成视觉识别Web入口": web_identified,
+            "已完成页面识别Web入口": web_identified,
             "有系统名称或用途Web入口": web_named,
             "Web识别覆盖率": web_coverage,
             "Web识别方式分布": dict(sorted(web_methods.items())),
-            "视觉复核项": len(visual_review_rows),
+            "页面识别复核项": len(visual_review_rows),
             "高风险项": risk_counts.get("高", 0),
             "中风险项": risk_counts.get("中", 0),
             "低风险项": risk_counts.get("低", 0),
@@ -2024,6 +2051,10 @@ class ReportService:
         }
 
     def _run_analyses(self, task_id: int, bundle: dict, context: dict, rerun_ai: bool = False) -> dict[str, str]:
+        prioritized_ports = self._prioritized_port_rows(context["port_rows"], context["risk_rows"])
+        # Never send local evidence paths or raw gateway errors to the report
+        # model: those details are useful for internal troubleshooting only.
+        prioritized_web = self._top_web_rows(context["customer_web_rows"], context["risk_rows"])
         sections = {
             "report_dns": {
                 "title": "DNS与域名解析分析",
@@ -2038,15 +2069,25 @@ class ReportService:
                 "payload": {
                     "stats": context["stats"],
                     "coverage_gaps": context["coverage_rows"],
-                    "open_ports": context["port_rows"][:500],
+                    "open_ports": prioritized_ports[:500],
+                    "selection": {
+                        "total_open_ports": len(prioritized_ports),
+                        "included_open_ports": min(len(prioritized_ports), 500),
+                        "strategy": "按本地风险分值、敏感端口和服务线索优先，而非按 IP/端口字典顺序截断。",
+                    },
                 },
             },
             "report_web": {
-                "title": "Web资产视觉识别分析",
+                "title": "Web资产页面识别分析",
                 "payload": {
                     "stats": context["stats"],
                     "coverage_gaps": context["coverage_rows"],
-                    "web_assets": context["web_rows"][:300],
+                    "web_assets": prioritized_web[:300],
+                    "selection": {
+                        "total_web_assets": len(prioritized_web),
+                        "included_web_assets": min(len(prioritized_web), 300),
+                        "strategy": "按远程接入、登录/管理入口、本地风险和识别质量优先，而非按 URL 字母顺序截断。",
+                    },
                 },
             },
         }
@@ -2061,6 +2102,26 @@ class ReportService:
             rerun_ai,
         )
         return results
+
+    def _prioritized_port_rows(self, port_rows: list[dict], risk_rows: list[dict]) -> list[dict]:
+        """Order the finite AI input so a large task cannot hide critical ports."""
+        risk_score_by_asset = {
+            str(row.get("资产") or ""): int(row.get("风险分值") or 0)
+            for row in risk_rows
+            if row.get("资产")
+        }
+        sensitive_ports = {21, 22, 23, 25, 110, 139, 143, 389, 445, 873, 1099, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8081, 8089, 8090, 8092, 8888, 9000, 9090, 9200, 9300, 11211, 27017}
+
+        def score(row: dict) -> tuple[int, int, int, str, str, int]:
+            port = int(row.get("端口") or 0)
+            asset = f"{row.get('IP') or ''}:{port}"
+            text = " ".join(_text(row.get(key)) for key in ("服务", "产品", "版本", "Web标题", "Web URL")).lower()
+            risk_score = risk_score_by_asset.get(asset, 0)
+            sensitivity = 1 if port in sensitive_ports or any(keyword in text for keyword in ("vpn", "easyconnect", "admin", "manage", "数据库", "database")) else 0
+            active = 1 if row.get("主动扫描确认") == "是" else 0
+            return (-risk_score, -sensitivity, -active, str(row.get("单位") or ""), str(row.get("IP") or ""), port)
+
+        return sorted(port_rows, key=score)
 
     def _analysis(self, task_id: int, analysis_type: str, title: str, payload: dict, rerun_ai: bool) -> str:
         prompt = self._analysis_prompt(title, payload)
@@ -2137,7 +2198,7 @@ class ReportService:
         stats = payload.get("stats") or {}
         lines = [f"{title}："]
         if error:
-            lines.append(f"AI 分析未完成，已使用本地统计生成摘要。错误：{error[:300]}")
+            lines.append("AI 分析未完成，已使用本地统计生成摘要；原始诊断信息仅保留在内部审计记录中。")
         lines.append(
             "当前任务共覆盖 "
             f"{stats.get('单位数量', 0)} 家单位、{stats.get('DNS记录数量', 0)} 条 DNS 记录、"
@@ -2164,7 +2225,7 @@ class ReportService:
 
     def _write_report_ai_audit(self, task_id: int) -> Path:
         payload = self._report_ai_audit_payload(task_id)
-        output_dir = Path("data") / "report" / f"task_{task_id}"
+        output_dir = self.config.data_path("report", f"task_{task_id}")
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "report_ai_audit.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2327,9 +2388,9 @@ class ReportService:
     def _write_web_workbook(self, path: Path, context: dict) -> Path:
         sheets = {
             "重点Web资产": context["key_web_rows"],
-            "截图证据": context["screenshot_evidence_rows"],
-            "Web资产详情": context["web_rows"],
-            "视觉复核清单": context["visual_review_rows"],
+            "HTML证据": context["html_evidence_rows"],
+            "Web资产详情": context["customer_web_rows"],
+            "页面识别复核清单": context["visual_review_rows"],
         }
         return self._write_workbook(path, {"阅读导航": self._navigation_rows("web", sheets), **sheets})
 
@@ -2355,9 +2416,9 @@ class ReportService:
             "URL入口覆盖": "70AD47",
             "非域名资产": "A5A5A5",
             "重点Web资产": "C00000",
-            "截图证据": "70AD47",
+            "HTML证据": "70AD47",
             "Web资产详情": "4472C4",
-            "视觉复核清单": "ED7D31",
+            "页面识别复核清单": "ED7D31",
         }
         for sheet_name, rows in sheets.items():
             ws = wb.create_sheet(sheet_name[:31])
@@ -2376,8 +2437,6 @@ class ReportService:
             self._add_sheet_links(ws, headers)
             if sheet_name == "管理驾驶舱":
                 self._add_dashboard_charts(ws, rows)
-            if sheet_name == "截图证据":
-                self._embed_screenshot_thumbnails(ws, rows, headers)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             wb.save(path)
@@ -2395,36 +2454,6 @@ class ReportService:
                 if key not in headers:
                     headers.append(key)
         return headers
-
-    def _embed_screenshot_thumbnails(self, ws, rows: list[dict], headers: list[str]) -> None:
-        if "缩略图" not in headers or "截图文件" not in headers:
-            return
-        thumb_column = headers.index("缩略图") + 1
-        screenshot_column = headers.index("截图文件") + 1
-        ws.column_dimensions[get_column_letter(thumb_column)].width = 34
-        embedded = 0
-        for row_index, row in enumerate(rows, start=2):
-            if MAX_EXCEL_SCREENSHOT_THUMBNAILS is not None and embedded >= MAX_EXCEL_SCREENSHOT_THUMBNAILS:
-                break
-            path_text = _text(row.get("截图文件"))
-            if not path_text:
-                continue
-            path = Path(path_text)
-            if not path.is_absolute():
-                path = Path.cwd() / path
-            if not path.exists():
-                continue
-            try:
-                image = XLImage(str(path))
-                image.width = 220
-                image.height = 124
-                ws.add_image(image, f"{get_column_letter(thumb_column)}{row_index}")
-                ws.row_dimensions[row_index].height = 98
-                ws.cell(row=row_index, column=screenshot_column).hyperlink = str(path)
-                ws.cell(row=row_index, column=screenshot_column).style = "Hyperlink"
-                embedded += 1
-            except Exception:
-                ws.cell(row=row_index, column=thumb_column).value = "缩略图嵌入失败"
 
     def _add_dashboard_charts(self, ws, rows: list[dict]) -> None:
         groups = {
@@ -2548,6 +2577,7 @@ class ReportService:
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
         subtitle.runs[0].font.size = Pt(16)
         subtitle.runs[0].font.color.rgb = RGBColor(31, 78, 121)
+        _set_document_run_font(subtitle.runs[0])
         doc.add_paragraph(f"任务编号：{task.id}")
         doc.add_paragraph(f"生成时间：{_utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
         self._add_cover_meta_panel(doc, task, context)
@@ -2577,21 +2607,19 @@ class ReportService:
         self._add_paragraphs(doc, analyses.get("report_dns", ""))
         doc.add_heading("九、端口与服务暴露分析", level=1)
         self._add_paragraphs(doc, analyses.get("report_ports", ""))
-        doc.add_heading("十、Web 资产视觉识别分析", level=1)
+        doc.add_heading("十、Web 资产页面识别分析", level=1)
         self._add_paragraphs(doc, analyses.get("report_web", ""))
-        self._add_web_table(doc, self._top_web_rows(context["web_rows"], context["risk_rows"])[:20])
-        self._add_screenshot_gallery(doc, context["web_rows"])
+        self._add_web_table(doc, context["key_web_rows"][:20])
         doc.add_heading("十一、附件", level=1)
         doc.add_paragraph(
             f"附件 1：{asset_workbook.name}，包含报告概览、单位覆盖台账、覆盖缺口、风险清单、整改矩阵、"
             "管理驾驶舱、DNS记录、DNS复核清单、端口目标台账、开放端口、服务识别台账、URL入口覆盖、交付审计文件和非域名资产。"
         )
         doc.add_paragraph(
-            f"附件 2：{web_workbook.name}，包含重点 Web 资产、截图证据、AI 视觉识别结论、截图路径和视觉复核清单。"
+            f"附件 2：{web_workbook.name}，包含重点 Web 资产、HTML 证据编号、页面识别结论和复核清单。"
         )
         doc.add_paragraph(
-            "交付包同时包含质量摘要、待补充资产模板、复核工作单、端口目标来源、HTTP 探测审计、服务分类审计、"
-            "视觉识别审计、报告 AI 分析审计和 manifest 校验清单；具体用途见资产汇总附件中的“交付审计文件”工作表。"
+            "客户交付包同时包含质量摘要和 manifest 校验清单；原始 HTML、运行审计、复核工作单和补全计划仅在项目组内部审计包中留存。"
         )
         section = doc.sections[0]
         section.top_margin = Inches(0.75)
@@ -2610,7 +2638,8 @@ class ReportService:
 
     def _apply_doc_style(self, doc: Document, task: ScanTask) -> None:
         normal = doc.styles["Normal"]
-        normal.font.name = "Microsoft YaHei"
+        normal.font.name = DOCUMENT_CJK_FONT
+        _set_east_asian_font(normal._element)
         normal.font.size = Pt(10.5)
         for style_name, size, color in (
             ("Title", 22, RGBColor(31, 78, 121)),
@@ -2618,7 +2647,8 @@ class ReportService:
             ("Heading 2", 12, RGBColor(79, 129, 189)),
         ):
             style = doc.styles[style_name]
-            style.font.name = "Microsoft YaHei"
+            style.font.name = DOCUMENT_CJK_FONT
+            _set_east_asian_font(style._element)
             style.font.size = Pt(size)
             style.font.color.rgb = color
             style.font.bold = True
@@ -2627,14 +2657,14 @@ class ReportService:
         header.text = f"互联网数字资产暴露面测绘报告 | {task.target}"
         header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         for run in header.runs:
-            run.font.name = "Microsoft YaHei"
+            _set_document_run_font(run)
             run.font.size = Pt(8)
             run.font.color.rgb = RGBColor(127, 127, 127)
         footer = section.footer.paragraphs[0]
-        footer.text = "assetmap 自动生成 | 仅用于授权资产测绘与安全治理"
+        footer.text = "仅用于授权范围内的互联网资产测绘与安全治理"
         footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for run in footer.runs:
-            run.font.name = "Microsoft YaHei"
+            _set_document_run_font(run)
             run.font.size = Pt(8)
             run.font.color.rgb = RGBColor(127, 127, 127)
 
@@ -2644,6 +2674,8 @@ class ReportService:
         rows = [
             ("报告对象", task.target),
             ("任务编号", str(task.id)),
+            ("报告版本", "v1.0"),
+            ("使用范围", "仅限授权范围内的安全治理与复核"),
             ("报告状态", self._report_status(context["coverage_rows"])),
             (
                 "交付范围",
@@ -2696,14 +2728,14 @@ class ReportService:
             ("一、报告摘要", "总体结论、关键发现、风险概览", "先看"),
             ("二、测绘范围与方法", "数据来源、测绘链路、风险判断口径", "先看"),
             ("三、资产统计", "单位、资产、端口、Web入口和覆盖矩阵", "附件1"),
-            ("四、覆盖缺口分析", "资产、DNS、端口、服务、URL和视觉识别缺口", "附件1"),
+            ("四、覆盖缺口分析", "资产、DNS、端口、服务、URL和页面识别缺口", "附件1"),
             ("五、复核与质量门禁计划", "交付后复核动作和下一轮补全路径", "工作单"),
             ("六、重点风险清单", "高/中风险暴露面和证据摘要", "附件1"),
             ("七、整改优先级矩阵", "处置节奏、责任建议和验收证据", "附件1"),
             ("八、DNS 与域名解析分析", "根域名、解析质量、CNAME/共享IP线索", "附件1"),
             ("九、端口与服务暴露分析", "开放端口、主动/被动证据和服务指纹", "附件1"),
-            ("十、Web 资产视觉识别分析", "系统名称、用途、截图证据和复核清单", "附件2"),
-            ("十一、附件", "Excel附件、质量摘要、审计文件和交付清单", "交付包"),
+            ("十、Web 资产页面识别分析", "系统名称、用途、HTML 证据和复核清单", "附件2"),
+            ("十一、附件", "Excel附件、质量摘要和交付清单", "交付包"),
         ]
         table = doc.add_table(rows=1, cols=3)
         table.style = "Table Grid"
@@ -2726,7 +2758,7 @@ class ReportService:
                     if align_center or row_index == 0:
                         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     for run in paragraph.runs:
-                        run.font.name = "Microsoft YaHei"
+                        _set_document_run_font(run)
                         run.font.size = Pt(9)
                 if row_index == 0:
                     self._set_cell_shading(cell, header_fill)
@@ -2848,10 +2880,10 @@ class ReportService:
             ("服务复核项", stats.get("服务复核项", 0)),
             ("Web入口数量", stats.get("Web入口数量", 0)),
             ("URL入口复核项", stats.get("URL入口复核项", 0)),
-            ("已完成视觉识别Web入口", stats.get("已完成视觉识别Web入口", 0)),
+            ("已完成页面识别Web入口", stats.get("已完成页面识别Web入口", 0)),
             ("有系统名称或用途Web入口", stats.get("有系统名称或用途Web入口", 0)),
             ("Web识别覆盖率", stats.get("Web识别覆盖率", "0%")),
-            ("视觉复核项", stats.get("视觉复核项", 0)),
+            ("页面识别复核项", stats.get("页面识别复核项", 0)),
             ("覆盖缺口项", stats.get("覆盖缺口项", 0)),
             ("高风险项", stats.get("高风险项", 0)),
             ("中风险项", stats.get("中风险项", 0)),
@@ -2893,9 +2925,9 @@ class ReportService:
 
     def _add_methodology(self, doc: Document, stats: dict) -> None:
         paragraphs = [
-            "本报告基于企业股权/备案资产采集、手工补充资产、子域名枚举、DNS 解析、被动/主动端口发现、服务识别、Web 页面截图与多模态 AI 识别结果生成。",
+            "本报告基于企业股权/备案资产采集、手工补充资产、子域名枚举、DNS 解析、被动/主动端口发现、服务识别、Web 页面渲染 HTML 与 AI 文本识别结果生成。",
             "测绘对象覆盖目标企业及其控股链路中的相关单位，资产类型包括备案域名、子域名、公网 IP、开放端口、Web 入口、APP、小程序、微信公众号/服务号与邮箱线索。",
-            "风险判断采用本地规则与 AI 分块分析结合的方式：本地规则用于识别远程接入、敏感服务、管理入口等高价值暴露面；AI 用于对 DNS、端口、Web 视觉识别结果进行上下文总结。",
+            "风险判断采用本地规则与 AI 分块分析结合的方式：本地规则用于识别远程接入、敏感服务、管理入口等高价值暴露面；AI 用于对 DNS、端口、Web 页面识别结果进行上下文总结。",
             f"本次数据规模：单位 {stats.get('单位数量', 0)} 家，DNS 记录 {stats.get('DNS记录数量', 0)} 条，开放端口 {stats.get('开放端口数量', 0)} 个，Web 入口 {stats.get('Web入口数量', 0)} 个。",
             "报告中的风险等级用于整改优先级排序，不替代漏洞验证结论；高风险项建议优先完成业务必要性确认、访问控制收敛、弱口令与版本漏洞核查。",
         ]
@@ -2922,9 +2954,9 @@ class ReportService:
                 "优先处理远程接入、敏感服务和管理入口暴露。",
             ),
             (
-                "视觉识别",
+                "页面识别",
                 f"Web 识别覆盖率 {stats.get('Web识别覆盖率', '0%')}，识别方式：{json.dumps(stats.get('Web识别方式分布', {}), ensure_ascii=False)}。",
-                "对降级识别页面安排人工复核，必要时补充截图或登录态验证。",
+                "对降级识别页面安排人工复核，必要时补充 HTML 证据或登录态验证。",
             ),
             (
                 "覆盖缺口",
@@ -2995,7 +3027,7 @@ class ReportService:
             ),
             ("子域名/DNS", f"DNS复核项 {stats.get('DNS复核项', 0)} 个", "低", "优先处理工具失败、无公网解析和第三方/停放 CNAME。"),
             ("服务识别/URL", f"服务复核项 {stats.get('服务复核项', 0)} 个，URL入口复核项 {stats.get('URL入口复核项', 0)} 个", "低", "复核疑似 Web 端口、URL 关联和 Host 绑定。"),
-            ("URL视觉识别", f"视觉复核项 {stats.get('视觉复核项', 0)} 个", "低", "复核降级识别、低置信度和截图失败页面。"),
+            ("URL页面识别", f"页面识别复核项 {stats.get('页面识别复核项', 0)} 个", "低", "复核降级识别、低置信度和页面渲染失败入口。"),
         ]
         doc.add_paragraph("以下复核计划来自质量门禁和附件台账，用于指导交付后的补充核验与下一轮复测。")
         table = doc.add_table(rows=1, cols=4)
@@ -3017,7 +3049,7 @@ class ReportService:
             self._review_item("DNS复核", context["dns_quality_rows"], "根域名", "复核原因", "建议动作"),
             self._review_item("服务识别复核", context["service_audit_rows"], "IP", "分类依据", "建议动作", port_key="端口"),
             self._review_item("URL入口复核", context["url_coverage_rows"], "URL入口样例", "覆盖结论", "建议动作"),
-            self._review_item("视觉识别复核", context["visual_review_rows"], "URL", "复核原因", "建议动作"),
+            self._review_item("页面识别复核", context["visual_review_rows"], "URL", "复核原因", "建议动作"),
         ]
         table = doc.add_table(rows=1, cols=5)
         table.style = "Table Grid"
@@ -3137,32 +3169,32 @@ class ReportService:
                 value += 30
             if row.get("AI识别系统") or row.get("网站用途"):
                 value += 10
-            if row.get("识别方式") == "screenshot_ai":
+            if row.get("识别方式") == "rendered_html_ai":
                 value += 5
             return (-value, row.get("URL") or "")
 
         return sorted(web_rows, key=score)
 
-    def _screenshot_evidence_rows(self, web_rows: list[dict], risk_rows: list[dict]) -> list[dict]:
+    def _html_evidence_rows(self, web_rows: list[dict], risk_rows: list[dict]) -> list[dict]:
         rows = []
-        for row in self._top_web_rows(web_rows, risk_rows):
-            screenshot = row.get("截图") or ""
-            screenshot_exists = bool(screenshot and Path(str(screenshot)).exists())
-            if screenshot_exists:
-                status = "有截图"
+        for index, row in enumerate(self._top_web_rows(web_rows, risk_rows), start=1):
+            html_path = row.get("HTML证据") or ""
+            html_exists = bool(html_path and Path(str(html_path)).exists())
+            if html_exists:
+                status = "有HTML"
                 missing_reason = ""
-            elif screenshot:
-                status = "截图文件缺失"
-                missing_reason = f"数据库记录了截图路径，但本地文件不存在：{screenshot}"
+            elif html_path:
+                status = "HTML文件缺失"
+                missing_reason = "内部审计记录显示 HTML 证据文件缺失，需由项目组复核。"
             elif row.get("分析错误"):
                 status = "需复核"
                 missing_reason = row.get("分析错误") or ""
             else:
-                status = "无截图"
-                missing_reason = row.get("降级原因") or "该页面使用重复页面复用或 HTTP 探测降级识别，未生成独立截图。"
+                status = "无HTML"
+                missing_reason = row.get("降级原因") or "该页面使用重复页面复用或 HTTP 探测降级识别，未生成独立 HTML。"
             rows.append(
                 {
-                    "缩略图": "",
+                    "证据编号": f"HTML-{index:04d}",
                     "单位": row.get("单位"),
                     "URL": row.get("URL"),
                     "系统/标题": row.get("AI识别系统") or row.get("HTML标题"),
@@ -3170,12 +3202,33 @@ class ReportService:
                     "页面类型": row.get("页面类型"),
                     "识别方式": row.get("识别方式"),
                     "识别置信度": row.get("识别置信度"),
-                    "截图状态": status,
-                    "截图文件": screenshot,
-                    "截图缺失原因": missing_reason,
+                    "HTML状态": status,
+                    # The customer attachment must remain portable.  The raw
+                    # path is intentionally excluded; the package evidence
+                    # manifest maps this stable identifier in internal use.
+                    "HTML文件": f"HTML-{index:04d}",
+                    "证据保管": "项目组内部审计包",
+                    "HTML缺失原因": missing_reason,
                     "复核建议": missing_reason or self._visual_review_action("低", row.get("识别方式") or "", ""),
                 }
             )
+        return rows
+
+    def _customer_web_rows(self, web_rows: list[dict], html_evidence_rows: list[dict]) -> list[dict]:
+        """Return a client-safe Web view without host filesystem paths/errors."""
+        evidence_ids = {
+            _normalize_url_for_match(row.get("URL")): row.get("证据编号")
+            for row in html_evidence_rows
+            if row.get("URL") and row.get("证据编号")
+        }
+        rows: list[dict] = []
+        for row in web_rows:
+            item = dict(row)
+            evidence_id = evidence_ids.get(_normalize_url_for_match(item.get("URL")))
+            item["HTML证据"] = evidence_id or ""
+            if item.get("分析错误"):
+                item["分析错误"] = "页面识别未完成，原始诊断信息已在内部审计中留存。"
+            rows.append(item)
         return rows
 
     def _add_web_table(self, doc: Document, rows: list[dict]) -> None:
@@ -3184,7 +3237,7 @@ class ReportService:
         doc.add_heading("重点 Web 资产摘录", level=2)
         table = doc.add_table(rows=1, cols=5)
         table.style = "Table Grid"
-        headers = ["单位", "URL", "系统/标题", "用途", "截图/错误"]
+        headers = ["单位", "URL", "系统/标题", "用途", "HTML/错误"]
         for index, header in enumerate(headers):
             table.rows[0].cells[index].text = header
         for row in rows:
@@ -3193,28 +3246,6 @@ class ReportService:
             cells[1].text = _short(row.get("URL"), 120)
             cells[2].text = _short(row.get("AI识别系统") or row.get("HTML标题"), 120)
             cells[3].text = _short(row.get("网站用途"), 180)
-            cells[4].text = _short(row.get("截图") or row.get("分析错误"), 180)
+            evidence_id = row.get("HTML证据") or "未留存"
+            cells[4].text = f"{evidence_id}（原始证据由项目组内部留存）" if evidence_id != "未留存" else "未留存；详见复核清单"
         self._format_table(table)
-
-    def _add_screenshot_gallery(self, doc: Document, rows: list[dict]) -> None:
-        screenshots = []
-        for row in rows:
-            path_text = row.get("截图")
-            if not path_text:
-                continue
-            path = Path(path_text)
-            if not path.is_absolute():
-                path = Path.cwd() / path
-            if path.exists():
-                screenshots.append((row, path))
-        if not screenshots:
-            return
-        doc.add_heading("重点 Web 页面截图", level=2)
-        for row, path in screenshots[:8]:
-            caption = doc.add_paragraph()
-            caption.add_run(_short(row.get("AI识别系统") or row.get("HTML标题") or "Web资产", 80)).bold = True
-            caption.add_run(f"  {row.get('URL') or ''}")
-            try:
-                doc.add_picture(str(path), width=Cm(15.5))
-            except Exception:
-                doc.add_paragraph(f"截图无法嵌入：{path}")

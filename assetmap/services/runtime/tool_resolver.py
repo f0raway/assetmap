@@ -21,11 +21,15 @@ def _windows_nmap() -> Path | None:
 
 
 class ToolResolver:
-    def __init__(self, config: ToolCommandConfig) -> None:
+    def __init__(self, config: ToolCommandConfig, base_dir: Path | None = None) -> None:
         self.config = config
+        self.base_dir = base_dir
 
     def executable(self, tool_name: str) -> Path | None:
-        local = Path(self.config.tools_dir) / tool_name / _exe_name(tool_name)
+        tools_dir = Path(self.config.tools_dir)
+        if self.base_dir and not tools_dir.is_absolute():
+            tools_dir = self.base_dir / tools_dir
+        local = tools_dir / tool_name / _exe_name(tool_name)
         if local.exists():
             return local
         if tool_name == "nmap":
@@ -38,15 +42,18 @@ class ToolResolver:
     def nmap_executable(self) -> Path | None:
         return self.executable("nmap")
 
+    def httpx_executable(self) -> Path | None:
+        return self.executable("httpx")
+
     def check_environment(
         self,
         include_subdomain_tools: bool = True,
         include_nmap: bool = True,
+        include_httpx: bool = False,
     ) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
         if include_subdomain_tools:
-            for tool_name in self.config.subdomain_tools_enabled:
-                tool_name = tool_name.lower().strip()
+            for tool_name in ("subfinder", "dnsx"):
                 executable = self.executable(tool_name)
                 results.append(
                     {
@@ -64,6 +71,16 @@ class ToolResolver:
                     "ok": executable is not None,
                     "detail": str(executable) if executable else "not found in tools dir, PATH, or Program Files",
                     "suggestion": "Install Nmap or put nmap.exe under tools/nmap/.",
+                }
+            )
+        if include_httpx:
+            executable = self.httpx_executable()
+            results.append(
+                {
+                    "name": "httpx",
+                    "ok": executable is not None,
+                    "detail": str(executable) if executable else "not found in tools dir or PATH",
+                    "suggestion": "Install ProjectDiscovery httpx or put its binary under tools/httpx/.",
                 }
             )
         return results

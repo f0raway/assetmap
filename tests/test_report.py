@@ -49,14 +49,10 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
         display_name="example.cn",
         raw_payload={},
     )
-    screenshot_dir = tmp_path / "data" / "screenshots" / "task_1"
-    screenshot_dir.mkdir(parents=True)
-    screenshot_path = screenshot_dir / "1_example.png"
-    screenshot_path.write_bytes(
-        base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-        )
-    )
+    html_dir = tmp_path / "data" / "rendered_html" / "task_1"
+    html_dir.mkdir(parents=True)
+    html_path = html_dir / "1_example.html"
+    html_path.write_text("<html><title>示例门户</title></html>", encoding="utf-8")
     session.add(task)
     session.add(company)
     session.add(domain)
@@ -107,7 +103,7 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
                 "visual_analysis": {
                     "system_name": "示例门户",
                     "site_purpose": "对外服务入口",
-                    "screenshot_path": str(screenshot_path),
+                        "rendered_html_path": str(html_path),
                 }
             },
         )
@@ -147,7 +143,7 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     doc = Document(result.report_path)
     assert "互联网数字资产暴露面测绘报告" in "\n".join(p.text for p in doc.paragraphs)
     assert "示例集团有限公司" in doc.sections[0].header.paragraphs[0].text
-    assert "assetmap 自动生成" in doc.sections[0].footer.paragraphs[0].text
+    assert "仅用于授权范围内" in doc.sections[0].footer.paragraphs[0].text
 
     assert len(doc.tables) >= 10
     asset_wb = load_workbook(result.asset_workbook_path)
@@ -171,9 +167,9 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     web_wb = load_workbook(result.web_workbook_path)
     assert web_wb.sheetnames[0] == "阅读导航"
     assert "重点Web资产" in web_wb.sheetnames
-    assert "截图证据" in web_wb.sheetnames
+    assert "HTML证据" in web_wb.sheetnames
     assert "Web资产详情" in web_wb.sheetnames
-    assert "视觉复核清单" in web_wb.sheetnames
+    assert "页面识别复核清单" in web_wb.sheetnames
     nav = asset_wb["阅读导航"]
     assert nav["A2"].value == "管理驾驶舱"
     assert nav["A2"].hyperlink.target == "#'管理驾驶舱'!A1"
@@ -225,12 +221,11 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
     key_web_headers = [cell.value for cell in next(key_web_sheet.iter_rows(min_row=1, max_row=1))]
     assert "URL" in key_web_headers
     assert "AI识别系统" in key_web_headers
-    evidence_sheet = load_workbook(result.web_workbook_path, read_only=True)["截图证据"]
+    evidence_sheet = load_workbook(result.web_workbook_path, read_only=True)["HTML证据"]
     evidence_headers = [cell.value for cell in next(evidence_sheet.iter_rows(min_row=1, max_row=1))]
-    assert "缩略图" in evidence_headers
-    assert "截图文件" in evidence_headers
-    assert "截图状态" in evidence_headers
-    review_sheet = load_workbook(result.web_workbook_path, read_only=True)["视觉复核清单"]
+    assert "HTML文件" in evidence_headers
+    assert "HTML状态" in evidence_headers
+    review_sheet = load_workbook(result.web_workbook_path, read_only=True)["页面识别复核清单"]
     assert review_sheet["A1"].value in {"无数据", "复核优先级"}
     overview = load_workbook(result.asset_workbook_path, read_only=True)["报告概览"]
     overview_headers = [cell.value for cell in next(overview.iter_rows(min_row=1, max_row=1))]
@@ -276,6 +271,7 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
         1,
         reports_dir=tmp_path / "reports",
         output_dir=tmp_path / "deliveries",
+        include_internal_evidence=True,
     )
     assert package.zip_path.exists()
     assert package.manifest_path.exists()
@@ -286,7 +282,7 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
         "task_1_互联网资产暴露面测绘报告.docx",
         "task_1_资产汇总.xlsx",
         "task_1_Web资产详情.xlsx",
-        "quality_summary.txt",
+        "质量摘要.txt",
         "task_1_待补充资产模板.yaml",
         "task_1_复核工作单.yaml",
         "task_1_补全计划.json",
@@ -294,32 +290,48 @@ def test_report_generates_docx_and_two_workbooks(tmp_path: Path, monkeypatch):
         "task_1_报告AI分析审计.json",
         "交付说明.txt",
     }
-    assert any(item["path"].startswith("screenshots/") and item["path"].endswith("1_example.png") for item in manifest["files"])
-    assert (package.package_dir / "screenshots" / "1_example.png").exists()
-    screenshot_manifest_path = package.package_dir / "task_1_截图证据清单.json"
-    assert any(item["path"] == "task_1_截图证据清单.json" for item in manifest["files"])
-    screenshot_manifest = __import__("json").loads(screenshot_manifest_path.read_text(encoding="utf-8"))
-    assert screenshot_manifest["screenshot_count"] == 1
-    assert screenshot_manifest["file_count"] == 1
-    screenshot_record = screenshot_manifest["screenshots"][0]
-    assert screenshot_record["url"] == "https://www.example.cn/"
-    assert screenshot_record["host"] == "www.example.cn"
-    assert screenshot_record["package_path"] == "screenshots/1_example.png"
-    assert screenshot_record["source_path"].endswith("1_example.png")
-    assert screenshot_record["system_name"] == "示例门户"
-    screenshot_manifest_record = next(item for item in manifest["files"] if item["path"] == "screenshots/1_example.png")
-    assert screenshot_record["package_size"] == screenshot_manifest_record["size"]
-    assert screenshot_record["package_sha256"] == screenshot_manifest_record["sha256"]
+    assert any(item["path"].startswith("rendered_html/") and item["path"].endswith("1_example.html") for item in manifest["files"])
+    assert (package.package_dir / "rendered_html" / "1_example.html").exists()
+    html_manifest_path = package.package_dir / "task_1_渲染HTML证据清单.json"
+    assert any(item["path"] == "task_1_渲染HTML证据清单.json" for item in manifest["files"])
+    html_manifest = __import__("json").loads(html_manifest_path.read_text(encoding="utf-8"))
+    assert html_manifest["rendered_html_count"] == 1
+    assert html_manifest["file_count"] == 1
+    html_record = html_manifest["rendered_html"][0]
+    assert html_record["url"] == "https://www.example.cn/"
+    assert html_record["host"] == "www.example.cn"
+    assert html_record["package_path"] == "rendered_html/1_example.html"
+    assert html_record["source_file_name"] == "1_example.html"
+    assert html_record["system_name"] == "示例门户"
+    html_manifest_record = next(item for item in manifest["files"] if item["path"] == "rendered_html/1_example.html")
+    assert html_record["package_size"] == html_manifest_record["size"]
+    assert html_record["package_sha256"] == html_manifest_record["sha256"]
     assert DeliveryPackageVerifier().verify(package.package_dir).status == "PASS"
     assert DeliveryPackageVerifier().verify(package.zip_path).status == "PASS"
 
-    screenshot_manifest["screenshots"][0]["package_sha256"] = "0" * 64
-    screenshot_manifest_path.write_text(__import__("json").dumps(screenshot_manifest, ensure_ascii=False), encoding="utf-8")
-    screenshot_broken = DeliveryPackageVerifier().verify(package.package_dir)
-    assert screenshot_broken.status == "FAIL"
-    assert any("截图证据清单哈希" in item for item in screenshot_broken.failures)
-    screenshot_manifest["screenshots"][0]["package_sha256"] = screenshot_manifest_record["sha256"]
-    screenshot_manifest_path.write_text(__import__("json").dumps(screenshot_manifest, ensure_ascii=False), encoding="utf-8")
+    client_package = DeliveryPackageService(session, config).package(
+        1,
+        reports_dir=tmp_path / "reports",
+        output_dir=tmp_path / "client_deliveries",
+    )
+    client_manifest = __import__("json").loads(client_package.manifest_path.read_text(encoding="utf-8"))
+    client_paths = {item["path"] for item in client_manifest["files"]}
+    assert client_manifest["audience"] == "client"
+    assert "rendered_html/1_example.html" not in client_paths
+    assert not any("审计" in path or "补全计划" in path or "复核工作单" in path for path in client_paths)
+    client_web = load_workbook(client_package.package_dir / "task_1_Web资产详情.xlsx", read_only=True)["HTML证据"]
+    client_values = [cell for row in client_web.iter_rows(min_row=2, values_only=True) for cell in row if isinstance(cell, str)]
+    assert str(html_path) not in client_values
+    assert "HTML-0001" in client_values
+    assert DeliveryPackageVerifier().verify(client_package.zip_path).status == "PASS"
+
+    html_manifest["rendered_html"][0]["package_sha256"] = "0" * 64
+    html_manifest_path.write_text(__import__("json").dumps(html_manifest, ensure_ascii=False), encoding="utf-8")
+    html_broken = DeliveryPackageVerifier().verify(package.package_dir)
+    assert html_broken.status == "FAIL"
+    assert any("渲染HTML证据清单哈希" in item for item in html_broken.failures)
+    html_manifest["rendered_html"][0]["package_sha256"] = html_manifest_record["sha256"]
+    html_manifest_path.write_text(__import__("json").dumps(html_manifest, ensure_ascii=False), encoding="utf-8")
 
     report_ai_audit_path = package.package_dir / "task_1_报告AI分析审计.json"
     report_ai_audit_original = report_ai_audit_path.read_bytes()
@@ -727,8 +739,8 @@ def test_package_copies_visual_audit_files(tmp_path: Path, monkeypatch):
 
     copied = DeliveryPackageService(session, config)._copy_visual_audit_files(1, package_dir)
 
-    assert {path.name for path in copied} == {"task_1_视觉识别审计.json"}
-    assert (package_dir / "task_1_视觉识别审计.json").exists()
+    assert {path.name for path in copied} == {"task_1_Web页面识别审计.json"}
+    assert (package_dir / "task_1_Web页面识别审计.json").exists()
 
 
 def test_package_copies_report_ai_audit_files(tmp_path: Path, monkeypatch):
@@ -993,39 +1005,36 @@ def test_screenshot_evidence_rows_keep_all_visual_results(tmp_path: Path):
             "AI识别系统": f"系统{index}",
             "HTML标题": f"系统{index}",
             "网站用途": "业务系统",
-            "识别方式": "screenshot_ai",
+            "识别方式": "rendered_html_ai",
             "识别置信度": 0.9,
-            "截图": f"shot{index}.png",
+            "HTML证据": f"page{index}.html",
             "分析错误": "",
         }
         for index in range(60)
     ]
 
-    rows = service._screenshot_evidence_rows(web_rows, [])
+    rows = service._html_evidence_rows(web_rows, [])
 
     assert len(rows) == 60
     assert {row["URL"] for row in rows} == {row["URL"] for row in web_rows}
 
 
-def test_workbook_embeds_all_screenshot_thumbnails(tmp_path: Path):
+def test_workbook_preserves_html_evidence_paths_without_images(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     service = ReportService(session, config)
-    png_bytes = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-    )
     rows = []
     for index in range(25):
-        screenshot = tmp_path / f"shot_{index}.png"
-        screenshot.write_bytes(png_bytes)
-        rows.append({"缩略图": "", "URL": f"https://site{index}.example.cn/", "截图文件": str(screenshot)})
+        html_path = tmp_path / f"page_{index}.html"
+        html_path.write_text("<html>ok</html>", encoding="utf-8")
+        rows.append({"URL": f"https://site{index}.example.cn/", "HTML文件": str(html_path), "HTML状态": "有HTML"})
 
-    workbook_path = service._write_workbook(tmp_path / "web.xlsx", {"截图证据": rows})
-    sheet = load_workbook(workbook_path)["截图证据"]
+    workbook_path = service._write_workbook(tmp_path / "web.xlsx", {"HTML证据": rows})
+    sheet = load_workbook(workbook_path)["HTML证据"]
 
     assert sheet.max_row == 26
-    assert len(getattr(sheet, "_images", [])) == 25
+    assert len(getattr(sheet, "_images", [])) == 0
 
 
 def test_service_audit_rows_include_visual_summary(tmp_path: Path):
@@ -1073,23 +1082,39 @@ def test_service_audit_rows_include_visual_summary(tmp_path: Path):
                 "端口": 443,
                 "AI识别系统": "统一门户",
                 "网站用途": "业务入口",
-                "截图": "portal.png",
+                    "HTML证据": "portal.html",
             },
             {
                 "IP": "203.0.113.10",
                 "端口": 443,
                 "AI识别系统": "后台管理",
                 "网站用途": "管理入口",
-                "截图": "admin.png",
+                    "HTML证据": "admin.html",
             },
         ],
     )
 
     assert rows[0]["URL入口数量"] == 2
-    assert rows[0]["视觉识别数量"] == 2
-    assert rows[0]["截图数量"] == 2
+    assert rows[0]["页面识别数量"] == 2
+    assert rows[0]["HTML证据数量"] == 2
     assert rows[0]["AI识别系统"] == "统一门户；后台管理"
     assert rows[0]["网站用途"] == "业务入口；管理入口"
+
+
+def test_report_port_ai_input_prioritizes_risk_over_ip_sort_order(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+    ports = [
+        {"IP": "1.1.1.1", "端口": 80, "主动扫描确认": "是", "服务": "http"},
+        {"IP": "9.9.9.9", "端口": 3306, "主动扫描确认": "是", "服务": "mysql"},
+    ]
+    risks = [{"资产": "9.9.9.9:3306", "风险分值": 96}]
+
+    prioritized = service._prioritized_port_rows(ports, risks)
+
+    assert [(row["IP"], row["端口"]) for row in prioritized] == [("9.9.9.9", 3306), ("1.1.1.1", 80)]
 
 
 def test_visual_review_rows_explain_fallback_category_and_mojibake(tmp_path: Path):
@@ -1323,6 +1348,45 @@ def test_coverage_rows_flag_passive_only_port_evidence(tmp_path: Path):
     assert port_quality["缺口等级"] == "低"
     assert "被动FOFA-only 1 个" in port_quality["结果"]
     assert "8.8.8.8:443" in port_quality["缺口样例"]
+
+
+def test_coverage_uses_persisted_port_task_scope_not_all_dns_observations(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = ReportService(session, config)
+
+    rows = service._coverage_rows(
+        {
+            "companies": [],
+            "assets": [],
+            "subdomains": [],
+            "dns_records": [
+                {"fqdn": "origin.example.cn", "record_type": "A", "value": "203.0.113.10"},
+                {"fqdn": "cdn.example.cn", "record_type": "A", "value": "203.0.113.11"},
+            ],
+            "subdomain_tool_runs": [],
+            "service_assets": [],
+            "nmap_ports": [],
+            "nmap_task": {"targets": ["203.0.113.10"]},
+            "nmap_runs": [{"target_ip": "203.0.113.10"}],
+        },
+        [
+            {"主机名": "origin.example.cn", "记录类型": "A", "记录值": "203.0.113.10"},
+            {"主机名": "cdn.example.cn", "记录类型": "A", "记录值": "203.0.113.11"},
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [{"IP": "203.0.113.10"}, {"IP": "203.0.113.11"}],
+    )
+
+    port_coverage = next(row for row in rows if row["指标"] == "候选 IP 端口发现覆盖")
+    assert port_coverage["结果"] == "1/1 个候选 IP 存在端口发现任务或开放端口证据"
+    assert port_coverage["缺口等级"] == "无"
 
 
 def test_service_audit_rows_flag_web_like_non_web(tmp_path: Path):
