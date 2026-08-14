@@ -99,6 +99,9 @@ def test_quality_treats_partial_mapping_failures_as_warnings(tmp_path: Path):
 
     assert incomplete == []
     assert len(warnings) == 2
+    incomplete, warnings = service._pipeline_issues([("port-scan", "completed_with_gaps", "open_ports=0")])
+    assert incomplete == []
+    assert len(warnings) == 1
     incomplete, warnings = service._pipeline_issues([("report", "completed_with_errors", "artifacts=missing")])
     assert incomplete == ["report"]
     assert warnings == []

@@ -111,8 +111,8 @@ class DeliveryQualityService:
         for name, status, detail in stages:
             if status == "completed":
                 continue
-            if status == "completed_with_errors" and name in {"subdomains", "port-scan"}:
-                warnings.append(f"{name}阶段存在失败子任务，交付数据可能不完整: {detail}")
+            if status in {"completed_with_errors", "completed_with_gaps"} and name in {"subdomains", "port-scan"}:
+                warnings.append(f"{name}阶段存在覆盖缺口或失败子任务，交付数据可能不完整: {detail}")
                 continue
             incomplete.append(name)
         return incomplete, warnings

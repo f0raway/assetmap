@@ -2,6 +2,7 @@ import os
 
 from pathlib import Path
 
+import dns.exception
 from sqlmodel import select
 
 from assetmap.config import AppConfig, DatabaseConfig
@@ -10,9 +11,22 @@ from assetmap.models import AiAnalysis, Company, CompanyAssetLink, DnsQueryStatu
 from assetmap.services.mapping.nmap_scan import extract_ai_marked_service_ips
 from assetmap.services.mapping.subdomain import (
     SubdomainService,
+    _append_output_tail,
     _tool_line_dns_values,
     _tool_line_hostname,
 )
+
+
+def test_tool_output_tail_is_bounded():
+    from collections import deque
+
+    chunks: deque[str] = deque()
+    size = 0
+    size = _append_output_tail(chunks, size, "a" * 8, limit=10)
+    size = _append_output_tail(chunks, size, "b" * 8, limit=10)
+
+    assert size <= 10
+    assert "".join(chunks).endswith("b" * 8)
 
 
 def test_clear_dns_results_removes_records_and_statuses(tmp_path: Path):
@@ -411,13 +425,20 @@ def test_dns_resolution_skips_non_public_a_records(tmp_path: Path):
     assert [(row.record_type, row.value) for row in records] == [("A", "8.8.8.8")]
 
 
-def test_dns_resolution_uses_doh_before_udp(tmp_path: Path):
+def test_dns_resolution_uses_doh_only_after_recursive_resolvers_fail(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     service = SubdomainService(session, config)
 
-    service._resolver = lambda: (_ for _ in ()).throw(AssertionError("UDP DNS should not be used"))  # type: ignore[method-assign]
+    class BrokenResolver:
+        nameservers = ["223.5.5.5"]
+
+        def resolve(self, _fqdn: str, _record_type: str):
+            raise dns.exception.Timeout("timed out")
+
+    service._fallback_resolvers = lambda: iter([("alidns-1", BrokenResolver())])  # type: ignore[method-assign]
+    service._resolver = lambda: BrokenResolver()  # type: ignore[method-assign]
     service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
         "completed": True,
         "records": [{"value": "47.101.48.251", "ttl": 120, "endpoint": "https://dns.google/resolve"}],
@@ -433,11 +454,150 @@ def test_dns_resolution_uses_doh_before_udp(tmp_path: Path):
     ]
 
 
+def test_dns_resolution_uses_domestic_resolver_without_calling_doh(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+
+    class FakeItem:
+        def to_text(self):
+            return "121.196.222.2"
+
+    class FakeAnswer:
+        rrset = type("Rrset", (), {"ttl": 600})()
+
+        def __iter__(self):
+            return iter([FakeItem()])
+
+    class FakeResolver:
+        def resolve(self, fqdn: str, record_type: str):
+            assert (fqdn, record_type) == ("www.example.cn", "A")
+            return FakeAnswer()
+
+    service._fallback_resolvers = lambda: iter([("alidns-1", FakeResolver())])  # type: ignore[method-assign]
+    service._resolver = lambda: (_ for _ in ()).throw(AssertionError("system DNS should not be used"))  # type: ignore[method-assign]
+    service._resolve_doh_records = lambda *_args: (_ for _ in ()).throw(AssertionError("DoH should not be used"))  # type: ignore[method-assign]
+
+    result = service._resolve_one(1, "www.example.cn", "example.cn", "A")
+
+    assert result == {"saved": 1, "skipped": 0}
+    record = session.exec(select(DnsRecord)).one()
+    assert (record.record_type, record.value, record.raw_payload["source"]) == ("A", "121.196.222.2", "dns")
+    status = session.exec(select(DnsQueryStatus)).one()
+    assert status.status == "completed"
+    assert status.error_message is None
+
+
+def test_dns_resolution_uses_domestic_resolver_before_system_dns(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+
+    class FakeItem:
+        def to_text(self):
+            return "121.196.222.2"
+
+    class FakeAnswer:
+        rrset = type("Rrset", (), {"ttl": 600})()
+
+        def __iter__(self):
+            return iter([FakeItem()])
+
+    class BrokenSystemResolver:
+        nameservers = ["1.1.1.1"]
+
+        def resolve(self, _fqdn: str, _record_type: str):
+            raise dns.exception.Timeout("timed out")
+
+    class DomesticResolver:
+        nameservers = ["223.5.5.5"]
+
+        def resolve(self, fqdn: str, record_type: str):
+            assert (fqdn, record_type) == ("www.example.cn", "A")
+            return FakeAnswer()
+
+    service._resolver = lambda: BrokenSystemResolver()  # type: ignore[method-assign]
+    service._fallback_resolvers = lambda: iter([("alidns-1", DomesticResolver())])  # type: ignore[method-assign]
+    service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
+        "completed": False,
+        "records": [],
+        "error": "DoH unavailable",
+    }
+
+    result = service._resolve_one(1, "www.example.cn", "example.cn", "A")
+
+    assert result == {"saved": 1, "skipped": 0}
+    record = session.exec(select(DnsRecord)).one()
+    assert record.raw_payload["resolver"] == "alidns-1"
+    assert record.raw_payload["nameservers"] == ["223.5.5.5"]
+
+
+def test_dnsx_command_enables_live_statistics(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}")).bind_config_path(tmp_path / "config.yaml")
+    service = SubdomainService(get_session(create_db_and_engine(config.database.url)), config)
+
+    command = service._format_command("builtin", "dnsx", "example.cn", tmp_path / "dnsx.txt")
+
+    assert " -stats " in command
+    assert " -rl 600 " in command
+    assert " -r " in command
+    assert "data/resolvers/domestic.txt" in command
+
+
+def test_dnsx_estimate_labels_rate_as_an_upper_bound(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}")).bind_config_path(tmp_path / "config.yaml")
+    wordlist = tmp_path / "data" / "wordlists" / "Subdomain.txt"
+    wordlist.parent.mkdir(parents=True)
+    wordlist.write_text("www\napi\n", encoding="utf-8")
+    config.domain_mapping.dnsx_wordlist = "data/wordlists/Subdomain.txt"
+    logs: list[str] = []
+
+    SubdomainService(get_session(create_db_and_engine(config.database.url)), config, progress=logs.append)._log_dnsx_estimate("example.cn")
+
+    assert "rate limit ceiling=" in logs[0]
+    assert "not an ETA" in logs[0]
+
+
+def test_dns_resolver_timeout_is_retryable_not_a_normal_empty_answer(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    service = SubdomainService(session, config)
+
+    class FakeResolver:
+        def resolve(self, _fqdn: str, _record_type: str):
+            raise dns.exception.Timeout("timed out")
+
+    service._resolver = lambda: FakeResolver()  # type: ignore[method-assign]
+    service._fallback_resolvers = lambda: iter(())  # type: ignore[method-assign]
+    service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
+        "completed": False,
+        "records": [],
+        "error": "DoH unavailable",
+    }
+
+    service._resolve_one(1, "www.example.cn", "example.cn", "A")
+
+    status = session.exec(select(DnsQueryStatus)).one()
+    assert status.status == "failed"
+    assert status.error_message == "DoH: DoH unavailable; recursive DNS: all recursive DNS resolvers failed: system=timed out"
+
+
 def test_dns_resolution_skips_polluted_doh_ip(tmp_path: Path):
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
     engine = create_db_and_engine(config.database.url)
     session = get_session(engine)
     service = SubdomainService(session, config)
+    class BrokenResolver:
+        nameservers = ["223.5.5.5"]
+
+        def resolve(self, _fqdn: str, _record_type: str):
+            raise dns.exception.Timeout("timed out")
+
+    service._fallback_resolvers = lambda: iter([("alidns-1", BrokenResolver())])  # type: ignore[method-assign]
+    service._resolver = lambda: BrokenResolver()  # type: ignore[method-assign]
     service._resolve_doh_records = lambda _fqdn, _record_type: {  # type: ignore[method-assign]
         "completed": True,
         "records": [{"value": "198.18.0.136", "ttl": 120, "endpoint": "https://dns.google/resolve"}],

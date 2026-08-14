@@ -6,6 +6,8 @@ import os
 import re
 import shlex
 import subprocess
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -42,6 +44,21 @@ INTERRUPTED_EXIT_CODES = {3221225786, -1073741510}
 INTERRUPTED_ERROR_MARKERS = ("^c", "keyboardinterrupt", "interrupted", "ctrl+c", "control-c")
 SUBDOMAIN_OUTPUT_MAX_LINES = 1000
 DNS_TIMEOUT_SECONDS = 6
+# Global DoH is used only after all domestic/local recursive resolvers fail.
+# Keep it short so unreachable overseas endpoints cannot hold up a scan.
+DOH_TIMEOUT_SECONDS = 3
+# Used only after the system resolver fails.  This is internal policy, not a
+# user-facing setting: a normal user should not need to tune DNS infrastructure
+# merely to run a scan.
+DNS_FALLBACK_TIMEOUT_SECONDS = 3
+DOMESTIC_RECURSIVE_DNS_SERVERS = (
+    ("alidns-1", "223.5.5.5"),
+    ("alidns-2", "223.6.6.6"),
+    ("dnspod", "119.29.29.29"),
+)
+DNSX_DOMESTIC_RESOLVERS_PATH = Path("data/resolvers/domestic.txt")
+DNSX_RATE_LIMIT = 600
+TOOL_OUTPUT_TAIL_MAX_CHARS = 20_000
 DNS_AI_BATCH_MAX_RECORDS = 1000
 DNS_AI_BATCH_MAX_CHARS = 45000
 DOH_ENDPOINTS = (
@@ -73,6 +90,19 @@ def _utcnow() -> datetime:
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "domain"
+
+
+def _append_output_tail(chunks: deque[str], size: int, value: str, limit: int = TOOL_OUTPUT_TAIL_MAX_CHARS) -> int:
+    """Retain only the latest tool output without accumulating wildcard noise."""
+    if len(value) >= limit:
+        chunks.clear()
+        chunks.append(value[-limit:])
+        return limit
+    chunks.append(value)
+    size += len(value)
+    while size > limit and chunks:
+        size -= len(chunks.popleft())
+    return size
 
 
 def _quote(value: str) -> str:
@@ -234,7 +264,7 @@ class SubdomainService:
             task.finished_at = _utcnow()
             self.session.add(task)
             self.session.commit()
-            self._log(f"[subdomain] task {task.id} interrupted by user")
+            self._log(f"[subdomain] scan task {scan_task_id} interrupted by user")
             raise
         except Exception as exc:
             task.status = "failed"
@@ -335,7 +365,7 @@ class SubdomainService:
     def _format_command(self, template: str, tool_name: str, domain: str, output: Path) -> str:
         templates = {
             "subfinder": "{binary} -d {domain} -silent -all -pc {provider_config} -o {output}",
-            "dnsx": "{binary} -silent -d {domain} -w {wordlist} -o {output} -t 100 -retry 2 -rl 300 -wt 5 -duc -nc",
+            "dnsx": "{binary} -silent -stats -d {domain} -w {wordlist} -r {resolvers} -o {output} -t 100 -retry 2 -rl {rate_limit} -wt 5 -duc -nc",
         }
         return templates[tool_name].format(
             binary=_quote(self._binary_path(tool_name)),
@@ -343,6 +373,8 @@ class SubdomainService:
             output=_quote(str(output)),
             provider_config=_quote(str(self.config.resolve_path(self.config.domain_mapping.subfinder_provider_config))),
             wordlist=_quote(str(self.config.resolve_path(self.config.domain_mapping.dnsx_wordlist))),
+            resolvers=_quote(str(self.config.resolve_path(DNSX_DOMESTIC_RESOLVERS_PATH))),
+            rate_limit=DNSX_RATE_LIMIT,
         )
 
     def _run_enumerators(self, scan_task_id: int, root_domains: list[str], rerun_tools: bool = False) -> None:
@@ -467,27 +499,96 @@ class SubdomainService:
             session.add(run)
             session.commit()
             self._log(f"[subdomain] {run.tool_name} -> {run.root_domain}")
+            if run.tool_name == "dnsx":
+                self._log_dnsx_estimate(run.root_domain)
+            proc = None
+            tool_started = time.monotonic()
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     run.command,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    bufsize=1,
                 )
-                run.exit_code = proc.returncode
-                run.stdout = proc.stdout[-20000:]
-                run.stderr = proc.stderr[-20000:]
+                output: deque[str] = deque()
+                output_size = 0
+                last_progress = 0.0
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    output_size = _append_output_tail(output, output_size, raw_line)
+                    line = raw_line.replace("\r", "").strip()
+                    if not line:
+                        continue
+                    # dnsx emits progress through -stats.  Throttle generic
+                    # output so a wildcard response cannot flood the terminal.
+                    now = time.monotonic()
+                    if run.tool_name != "dnsx" or "stats" in line.lower() or now - last_progress >= 15:
+                        self._log(f"[{run.tool_name}] {run.root_domain} | {line[:500]}")
+                        last_progress = now
+                run.exit_code = proc.wait()
+                combined_output = "".join(output)
+                run.stdout = combined_output[-20000:]
+                run.stderr = ""
                 run.status = "completed" if proc.returncode == 0 else "failed"
                 if proc.returncode != 0:
-                    run.error_message = proc.stderr[-2000:] or proc.stdout[-2000:]
+                    run.error_message = combined_output[-2000:]
+                if run.tool_name == "dnsx":
+                    elapsed_seconds = max(1.0, time.monotonic() - tool_started)
+                    wordlist = self.config.resolve_path(self.config.domain_mapping.dnsx_wordlist)
+                    try:
+                        with wordlist.open("r", encoding="utf-8", errors="ignore") as handle:
+                            candidates = sum(1 for line in handle if line.strip())
+                    except OSError:
+                        candidates = 0
+                    if candidates:
+                        self._log(
+                            f"[dnsx] {run.root_domain} | finished in {elapsed_seconds / 60:.1f} min; "
+                            f"effective candidate throughput={candidates / elapsed_seconds:.1f}/s."
+                        )
+            except KeyboardInterrupt:
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                run.status = "interrupted"
+                run.error_message = "Interrupted by user"
+                run.finished_at = _utcnow()
+                session.add(run)
+                session.commit()
+                self._log(f"[{run.tool_name}] {run.root_domain} | interrupted; child process stopped")
+                raise
             except Exception as exc:
                 run.status = "failed"
                 run.error_message = str(exc)
             run.finished_at = _utcnow()
             session.add(run)
             session.commit()
+
+    def _log_dnsx_estimate(self, root_domain: str) -> None:
+        wordlist = self.config.resolve_path(self.config.domain_mapping.dnsx_wordlist)
+        try:
+            with wordlist.open("r", encoding="utf-8", errors="ignore") as handle:
+                candidates = sum(1 for line in handle if line.strip())
+        except OSError:
+            self._log(f"[dnsx] {root_domain} | unable to count wordlist: {wordlist}")
+            return
+        minimum_minutes = candidates / DNSX_RATE_LIMIT / 60
+        self._log(
+            f"[dnsx] {root_domain} | full wordlist candidates={candidates:,}; "
+            f"rate limit ceiling={DNSX_RATE_LIMIT} req/s; ideal one-attempt lower bound≈{minimum_minutes:.0f} min, "
+            "not an ETA. Retries, timeout and resolver loss can extend the runtime substantially; "
+            "dnsx statistics below are the real progress source."
+        )
 
     def _log_tool_summary(self, scan_task_id: int) -> None:
         enabled_names = self._enabled_subdomain_tool_names()
@@ -602,6 +703,12 @@ class SubdomainService:
         no_public_ip = sorted(root_set - public_ip_roots)
         if no_public_ip:
             self._log(f"[dns] roots without public A/AAAA: {', '.join(no_public_ip[:10])}")
+        if failed_queries:
+            sample = "; ".join(
+                f"{row.fqdn} {row.record_type}: {str(row.error_message or '').strip()[:160]}"
+                for row in failed_queries[:3]
+            )
+            self._log(f"[dns] failed query sample: {sample}")
 
     def _write_subdomain_audit(self, scan_task_id: int, root_domains: list[str] | None = None) -> Path:
         root_domains = root_domains or self._root_domains(scan_task_id)
@@ -632,8 +739,11 @@ class SubdomainService:
             if row.root_domain in subdomains_by_root:
                 subdomains_by_root[row.root_domain] += 1
         dns_record_counts: dict[str, int] = {}
+        resolver_counts: dict[str, int] = {}
         for row in dns_rows:
             dns_record_counts[row.record_type] = dns_record_counts.get(row.record_type, 0) + 1
+            resolver = str((row.raw_payload or {}).get("resolver") or (row.raw_payload or {}).get("source") or "unknown")
+            resolver_counts[resolver] = resolver_counts.get(resolver, 0) + 1
         roots_with_dns = {row.root_domain for row in dns_rows if row.root_domain in root_set}
         roots_with_public_ip = {
             row.root_domain
@@ -684,6 +794,7 @@ class SubdomainService:
             "subdomains_by_root": dict(sorted(subdomains_by_root.items())),
             "roots_without_subdomains": sorted(root for root, count in subdomains_by_root.items() if count == 0),
             "dns_record_counts": dict(sorted(dns_record_counts.items())),
+            "dns_resolver_source_counts": dict(sorted(resolver_counts.items())),
             "roots_with_dns_count": len(roots_with_dns),
             "roots_with_public_ip_count": len(roots_with_public_ip),
             "failed_dns_query_count": len(failed_queries),
@@ -824,6 +935,48 @@ class SubdomainService:
         resolver.lifetime = DNS_TIMEOUT_SECONDS
         return resolver
 
+    def _fallback_resolvers(self) -> Iterable[tuple[str, dns.resolver.Resolver]]:
+        """Yield independent domestic public recursive resolvers first."""
+        for label, nameserver in DOMESTIC_RECURSIVE_DNS_SERVERS:
+            resolver = dns.resolver.Resolver(configure=False)
+            resolver.nameservers = [nameserver]
+            resolver.timeout = DNS_FALLBACK_TIMEOUT_SECONDS
+            resolver.lifetime = DNS_FALLBACK_TIMEOUT_SECONDS
+            yield label, resolver
+
+    def _resolve_recursive_records(self, fqdn: str, record_type: str) -> tuple[Any, str, list[str]]:
+        """Resolve through domestic DNS, then the local system resolver.
+
+        NXDOMAIN and NoAnswer are DNS answers rather than transport failures,
+        so they stop this fallback chain.  Timeouts and unusable name servers
+        try the next route.  If every route fails, the audit keeps each route's
+        error and the work unit remains retryable.
+        """
+        failures: list[str] = []
+        # Instantiate the system resolver only if every domestic resolver
+        # failed.  Besides avoiding needless local DNS work, this prevents a
+        # malformed system configuration from blocking a healthy domestic path.
+        attempts: list[tuple[str, dns.resolver.Resolver]] = list(self._fallback_resolvers())
+        for label, resolver in attempts:
+            try:
+                answer = resolver.resolve(fqdn, record_type)
+                return answer, label, [str(value) for value in getattr(resolver, "nameservers", [])]
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                raise
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                failures.append(f"{label}={message}")
+        try:
+            resolver = self._resolver()
+            answer = resolver.resolve(fqdn, record_type)
+            return answer, "system", [str(value) for value in getattr(resolver, "nameservers", [])]
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            raise
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            failures.append(f"system={message}")
+        raise RuntimeError("all recursive DNS resolvers failed: " + "; ".join(failures))
+
     def _resolve_domains(self, scan_task_id: int, domains: Iterable[str], record_types: Iterable[str]) -> None:
         jobs = []
         for domain in sorted(set(domains)):
@@ -911,7 +1064,39 @@ class SubdomainService:
                     root_domain=root_domain,
                     record_type=record_type,
                 )
+            doh_result: dict[str, Any] = {"completed": False, "records": [], "error": None}
             try:
+                answer, resolver_source, resolver_servers = self._resolve_recursive_records(fqdn, record_type)
+                for item in answer:
+                    value = self._format_dns_value(record_type, item)
+                    if record_type in {"A", "AAAA"} and not _is_public_ip(value):
+                        skipped += 1
+                        continue
+                    if self._upsert_dns_record(
+                        session,
+                        scan_task_id,
+                        fqdn,
+                        root_domain,
+                        record_type,
+                        value,
+                        ttl=answer.rrset.ttl if answer.rrset else None,
+                        raw_payload={
+                            "source": "dns",
+                            "resolver": resolver_source,
+                            "nameservers": resolver_servers,
+                            "transport": "udp",
+                            "text": item.to_text(),
+                        },
+                    ):
+                        saved += 1
+                status.status = "completed"
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as exc:
+                status.status = "completed"
+                status.error_message = str(exc).strip() or exc.__class__.__name__
+            except Exception as recursive_exc:
+                # DoH remains an independent last-resort evidence source, but
+                # it is no longer a mandatory first network hop for every DNS
+                # query.  This is both faster and more reliable in China.
                 doh_result = self._resolve_doh_records(fqdn, record_type)
                 if doh_result["completed"]:
                     for record in doh_result["records"]:
@@ -936,47 +1121,29 @@ class SubdomainService:
                             saved += 1
                     status.status = "completed"
                     status.error_message = str(doh_result.get("error") or "")[:1000] or None
-                    status.queried_at = _utcnow()
-                    session.add(status)
-                    session.commit()
-                    return {"saved": saved, "skipped": skipped}
-
-                resolver = self._resolver()
-                answer = resolver.resolve(fqdn, record_type)
-                for item in answer:
-                    value = self._format_dns_value(record_type, item)
-                    if record_type in {"A", "AAAA"} and not _is_public_ip(value):
-                        skipped += 1
-                        continue
-                    if self._upsert_dns_record(
-                        session,
-                        scan_task_id,
-                        fqdn,
-                        root_domain,
-                        record_type,
-                        value,
-                        ttl=answer.rrset.ttl if answer.rrset else None,
-                        raw_payload={"source": "dns", "text": item.to_text()},
-                    ):
-                        saved += 1
-                status.status = "completed"
-                status.error_message = None
-            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout) as exc:
-                status.status = "completed"
-                status.error_message = str(exc)[:1000]
-            except Exception as exc:
-                status.status = "failed"
-                status.error_message = str(exc)[:1000]
+                else:
+                    # Resolver connectivity failures remain retryable rather
+                    # than being recorded as a normal empty DNS answer.
+                    status.status = "failed"
+                    status.error_message = self._dns_error_message(doh_result, recursive_exc)
             status.queried_at = _utcnow()
             session.add(status)
             session.commit()
         return {"saved": saved, "skipped": skipped}
 
+    @staticmethod
+    def _dns_error_message(doh_result: dict[str, Any], exc: Exception) -> str:
+        doh_error = str(doh_result.get("error") or "").strip()
+        resolver_error = str(exc).strip() or exc.__class__.__name__
+        if doh_error:
+            return f"DoH: {doh_error}; recursive DNS: {resolver_error}"[:1000]
+        return resolver_error[:1000]
+
     def _resolve_doh_records(self, fqdn: str, record_type: str) -> dict[str, Any]:
         if record_type not in DOH_RECORD_TYPES:
             return {"completed": False, "records": [], "error": None}
         errors = []
-        doh_timeout = DNS_TIMEOUT_SECONDS
+        doh_timeout = DOH_TIMEOUT_SECONDS
         for endpoint in DOH_ENDPOINTS:
             try:
                 with httpx.Client(timeout=doh_timeout, trust_env=False) as client:

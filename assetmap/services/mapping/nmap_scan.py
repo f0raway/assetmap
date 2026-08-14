@@ -120,6 +120,20 @@ class NmapScanService:
         self.session.add(task)
         self.session.commit()
         try:
+            if not targets:
+                task.status = "completed_with_gaps"
+                task.error_message = (
+                    "No confirmed origin IPs found. Domain mapping produced no active-scan targets; "
+                    "review DNS evidence or import a manually confirmed IP."
+                )
+                task.finished_at = _utcnow()
+                self.session.add(task)
+                self.session.commit()
+                self._log(
+                    "[port] skipped: no confirmed origin IPs. Port discovery was not run; "
+                    "review DNS evidence or import a manually confirmed IP before retrying."
+                )
+                return task.id
             self._reset_stale_running_runs(scan_task_id)
             self._log(f"[port] targets: {len(targets)}")
             active_targets = self._preflight_targets(scan_task_id, targets, rerun=rerun)
@@ -557,11 +571,6 @@ class NmapScanService:
         )
         manifest = self._write_target_sources_manifest(scan_task_id, by_source, targets)
         self._log(f"[port] target source manifest: {manifest}")
-        if not targets:
-            raise ValueError(
-                "No confirmed origin IPs found. Run domain mapping and review its candidates, "
-                "or import a manual IP first."
-            )
         return targets
 
     def _write_target_sources_manifest(self, scan_task_id: int, by_source: dict[str, list[str]], targets: list[str]) -> Path:

@@ -6,7 +6,7 @@ from sqlmodel import select
 
 from assetmap.config import AppConfig, DatabaseConfig
 from assetmap.db import create_db_and_engine, get_session
-from assetmap.models import ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
+from assetmap.models import AssetClassificationTask, ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
 from assetmap.services.identification.url_discovery import UrlDiscoveryService, _clean_ai_text, _looks_blank, _page_state_summary
 
 
@@ -66,6 +66,20 @@ def test_run_requires_service_identification_before_visual_stage(tmp_path: Path)
 
     task = session.exec(select(UrlDiscoveryTask).where(UrlDiscoveryTask.scan_task_id == 1)).one()
     assert task.status == "failed"
+
+
+def test_run_accepts_completed_service_stage_with_zero_service_assets(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    session.add(AssetClassificationTask(scan_task_id=1, status="completed", stage="completed"))
+    session.commit()
+
+    UrlDiscoveryService(session, config).run(1, rerun=True)
+
+    task = session.exec(select(UrlDiscoveryTask).where(UrlDiscoveryTask.scan_task_id == 1)).one()
+    assert task.status == "completed"
+    assert session.exec(select(WebEntrypoint).where(WebEntrypoint.scan_task_id == 1)).all() == []
 
 
 def test_web_identification_fails_when_playwright_is_missing(tmp_path: Path, monkeypatch):
