@@ -37,6 +37,8 @@ data/*
 !data/manual_assets.example.yaml
 !data/wordlists/
 !data/wordlists/**
+!data/resolvers/
+!data/resolvers/**
 
 reports/
 deliveries/

@@ -46,28 +46,16 @@ assetmap install-tools
 
 `install-tools` 会安装 subfinder、dnsx、httpx；Nmap 会优先使用系统已安装版本。macOS 可使用 `brew install nmap`，Ubuntu/Debian 可使用 `sudo apt install nmap`。
 
-### 3. 填写配置
+### 3. 配置 AssetMap 主配置文件：`config.yaml`
 
-初始化会生成本机的 `config.yaml`。请先复制 Subfinder Provider 配置样例：
+`assetmap init` 会创建本机的 `config.yaml` 和数据库。编辑这个文件时，**只填写 AssetMap 自己的配置和凭证；不要把 Subfinder Provider Key 写进此文件。**
 
-```bash
-cp config/subfinder/provider-config.example.yaml config/subfinder/provider-config.yaml
-```
-
-Windows PowerShell：
-
-```powershell
-Copy-Item config\subfinder\provider-config.example.yaml config\subfinder\provider-config.yaml
-```
-
-接着编辑 `config.yaml`，至少填写下列凭证：
+替换已有字段的占位符，不要在文件末尾再追加同名配置段。以下是首次完整测绘所需的最小密钥配置；`control_threshold: 0.47`、`max_depth: 10`、字典路径和 Nmap 命令已经由初始化模板写好，通常无需改动。
 
 ```yaml
 enterprise_discovery:
   tycid: YOUR_TYCID
   auth_token: YOUR_TYC_AUTH_TOKEN
-  control_threshold: 0.47
-  max_depth: 10
 
 fofa:
   email: YOUR_FOFA_EMAIL
@@ -77,24 +65,46 @@ ai:
   enabled: true
   base_url: https://你的网关/v1
   api_key: YOUR_API_KEY
+  # Authorization 时程序会自动添加 "Bearer " 前缀；
+  # 若网关要求 api-key、x-api-key 等，请填写实际请求头名称。
   api_key_header: Authorization
   model: YOUR_TEXT_MODEL
 ```
 
-也可使用交互式向导：
+也可以使用交互式向导填写 `config.yaml`：
 
 ```bash
 assetmap configure
 ```
 
-最后检查环境和 AI 连通性：
+### 4. 单独准备 Subfinder Provider 文件：`config/subfinder/provider-config.yaml`
+
+这是 **Subfinder 的独立配置文件**，只保存 Chaos、Censys、FOFA、GitHub、SecurityTrails、Shodan、ZoomEye、VirusTotal 等第三方平台的 Key。它不是 `config.yaml` 的一个 YAML 段，也不能复制到 `config.yaml` 中。
+
+程序会通过 `-pc` 将该文件显式传给 Subfinder。即使暂时没有任何 Provider Key，也应创建一个空模板文件，保证 Subfinder 参数路径有效：
+
+```bash
+mkdir -p config/subfinder
+cp config/subfinder/provider-config.example.yaml config/subfinder/provider-config.yaml
+```
+
+Windows PowerShell：
+
+```powershell
+New-Item -ItemType Directory -Force config\subfinder | Out-Null
+Copy-Item config\subfinder\provider-config.example.yaml config\subfinder\provider-config.yaml
+```
+
+文件为空时 Subfinder 仍可运行，但被动发现覆盖率会降低。`config.yaml` 中的 `domain_mapping.subfinder_provider_config` 仅用于指定这个独立文件的位置；除非你移动了它，否则保持默认路径即可。
+
+### 5. 检查环境和 AI 文本接口
 
 ```bash
 assetmap env-check
 assetmap ai-check
 ```
 
-### 4. 执行一次完整测绘
+### 6. 执行一次完整测绘
 
 ```bash
 assetmap scan "某某集团有限公司"
@@ -146,10 +156,10 @@ assetmap run 12 --from-stage port-scan --rerun-ports
 | 配置段 | 字段 | 是否必填 | 作用 |
 | --- | --- | --- | --- |
 | `enterprise_discovery` | `tycid`、`auth_token` | 是 | 天眼查企业、股权与备案资产采集凭证。 |
-| `enterprise_discovery` | `control_threshold` | 是 | 控股追踪阈值，默认 `0.47`，表示持股比例大于或等于 47% 时继续追踪。 |
-| `enterprise_discovery` | `max_depth` | 是 | 股权追踪深度，目标企业为第 0 层。 |
-| `domain_mapping` | `subfinder_provider_config` | 是 | Subfinder 的 Provider Key 文件路径。文件可以先为空，但必须存在。 |
-| `domain_mapping` | `dnsx_wordlist` | 是 | dnsx 使用的子域名字典路径，默认是项目内完整字典。 |
+| `enterprise_discovery` | `control_threshold` | 默认即可 | 控股追踪阈值，默认 `0.47`，表示持股比例大于或等于 47% 时继续追踪。 |
+| `enterprise_discovery` | `max_depth` | 默认即可 | 股权追踪深度，目标企业为第 0 层；默认 `10`，设置为 `0` 表示不限制层级。 |
+| `domain_mapping` | `subfinder_provider_config` | 默认即可 | 指向独立的 `config/subfinder/provider-config.yaml`；这不是 Provider Key 的存放位置本身，通常无需修改。 |
+| `domain_mapping` | `dnsx_wordlist` | 是 | dnsx 使用的约 31.6 万条精简高覆盖字典路径。已去重、清除无效与长尾噪声，并保留高价值技术/业务标签；dnsx 固定使用 100 线程、600 请求/秒上限及内置国内递归 DNS 池。限速是上限，实际耗时受重试、超时和网络质量影响。 |
 | `tools` | `nmap_command` | 是 | Nmap 全端口服务识别命令模板。除非你了解扫描影响，否则保持默认。 |
 | `fofa` | `email`、`api_key` | 是 | FOFA 被动端口检索凭证。 |
 | `ai` | `base_url`、`api_key`、`model` | 是 | OpenAI 兼容文本模型，用于 DNS 判断、页面识别和报告分析。 |
@@ -376,10 +386,18 @@ assetmap/
 
 ### `env-check` 提示 Provider 配置文件不存在
 
-执行一次复制命令即可，即使你暂时没有 Provider Key：
+`assetmap init` 不会复制该文件。执行一次复制命令即可，即使你暂时没有 Provider Key：
 
 ```bash
+mkdir -p config/subfinder
 cp config/subfinder/provider-config.example.yaml config/subfinder/provider-config.yaml
+```
+
+Windows PowerShell：
+
+```powershell
+New-Item -ItemType Directory -Force config\subfinder | Out-Null
+Copy-Item config\subfinder\provider-config.example.yaml config\subfinder\provider-config.yaml
 ```
 
 没有 Key 时 Subfinder 仍可能运行，但结果覆盖率会下降。

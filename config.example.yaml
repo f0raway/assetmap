@@ -17,7 +17,8 @@ enterprise_discovery:
 # provider-config.yaml 单独保存外部平台密钥，真实文件不会提交到 Git。
 domain_mapping:
   subfinder_provider_config: config/subfinder/provider-config.yaml
-  # dnsx 使用的子域名字典。工具内部保持 100 并发和 300 请求/秒。
+  # dnsx 使用项目内置的 30 万条精简高覆盖字典。工具内部保持 100 并发、600 请求/秒，
+  # 并自动使用项目内置的阿里公共 DNS 与 DNSPod 递归 DNS 池。
   dnsx_wordlist: data/wordlists/Subdomain.txt
 
 # 本地外部工具与主动测绘参数。

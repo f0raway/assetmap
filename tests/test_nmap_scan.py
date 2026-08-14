@@ -46,6 +46,22 @@ def test_interrupted_legacy_batch_migrates_to_a_per_ip_recovery_job(tmp_path: Pa
     assert session.get(NmapScanRun, run.id).status == "interrupted"
 
 
+def test_port_stage_without_confirmed_origins_completes_with_a_reviewable_gap(tmp_path: Path):
+    config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))
+    engine = create_db_and_engine(config.database.url)
+    session = get_session(engine)
+    logs: list[str] = []
+
+    task_id = NmapScanService(session, config, progress=logs.append).run(1)
+
+    task = session.get(NmapScanTask, task_id)
+    assert task is not None
+    assert task.status == "completed_with_gaps"
+    assert task.targets == []
+    assert "No confirmed origin IPs found" in (task.error_message or "")
+    assert any("[port] skipped: no confirmed origin IPs" in line for line in logs)
+
+
 def test_completed_per_ip_nmap_unit_is_not_repeated_on_resume(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = AppConfig(database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'assetmap.db'}"))

@@ -149,6 +149,11 @@ class EnvironmentCheckService:
                 "Place a subdomain wordlist at domain_mapping.dnsx_wordlist or update config.yaml.",
             ),
             (
+                "runtime.dnsx_domestic_resolvers",
+                self.config.resolve_path("data/resolvers/domestic.txt"),
+                "Restore the bundled data/resolvers/domestic.txt file used by dnsx.",
+            ),
+            (
                 "domain_mapping.subfinder_provider_config",
                 self.config.resolve_path(self.config.domain_mapping.subfinder_provider_config),
                 "Copy config/subfinder/provider-config.example.yaml to the configured path and add provider keys.",

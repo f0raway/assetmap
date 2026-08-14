@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from assetmap.config import AppConfig
-from assetmap.models import ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
+from assetmap.models import AssetClassificationTask, ServiceAsset, UrlDiscoveryTask, WebEntrypoint, WebProbeResult
 from assetmap.services.identification.ai_client import chat_completion, completion_finish_reason
 
 
@@ -362,7 +362,22 @@ class UrlDiscoveryService:
             raise
 
     def _has_service_identification_result(self, scan_task_id: int) -> bool:
-        """A missing service row means the prerequisite stage was not run."""
+        """The prerequisite is a completed stage, not a non-empty result set.
+
+        A completed classification with no open ports has no ``ServiceAsset``
+        rows by design.  It must still allow Web identification to finish with
+        zero entrypoints so a one-click pipeline can continue to reporting.
+        """
+        task = self.session.exec(
+            select(AssetClassificationTask).where(
+                AssetClassificationTask.scan_task_id == scan_task_id
+            )
+        ).first()
+        if task and task.status == "completed":
+            return True
+        # Keep pre-task databases and standalone integrations compatible: a
+        # materialised service row is also sufficient evidence that service
+        # identification has already produced input for this stage.
         return (
             self.session.exec(
                 select(ServiceAsset.id).where(ServiceAsset.scan_task_id == scan_task_id)

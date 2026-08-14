@@ -20,6 +20,7 @@ def test_environment_check_reports_configured_and_missing_states(tmp_path: Path,
     results = {row["name"]: row for row in EnvironmentCheckService(config).check()}
 
     assert results["domain_mapping.dnsx_wordlist"]["ok"] is False
+    assert results["runtime.dnsx_domestic_resolvers"]["ok"] is True
     assert results["enterprise_discovery.tycid"]["ok"] is False
     assert results["enterprise_discovery.auth_token"]["ok"] is False
     assert results["ai"]["ok"] is True
